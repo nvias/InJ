@@ -1,101 +1,208 @@
-import Image from "next/image";
+"use client";
+
+import { useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { supabase } from "@/lib/supabase";
 
 export default function Home() {
-  return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-8 row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="https://nextjs.org/icons/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li>Save and see your changes instantly.</li>
-        </ol>
+  const [studentCode, setStudentCode] = useState("");
+  const [lessonCode, setLessonCode] = useState("");
+  const [showLessonCode, setShowLessonCode] = useState(false);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const router = useRouter();
+  const searchParams = useSearchParams();
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="https://nextjs.org/icons/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
+  // Auto-login z QR kódu (?code=ZAK00001)
+  useEffect(() => {
+    const codeFromUrl = searchParams?.get("code");
+    if (!codeFromUrl) return;
+    const clean = codeFromUrl.replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 8);
+    if (clean.length !== 8) return;
+    setStudentCode(clean);
+    // Auto-submit po krátkém okamžiku
+    (async () => {
+      setLoading(true);
+      const { data: student } = await supabase
+        .from("students").select("*, classes(*)").eq("student_code", clean).single();
+      if (!student) { setError("Neplatný kód žáka v odkazu"); setLoading(false); return; }
+      localStorage.setItem("inj-student", JSON.stringify({
+        studentId: student.id,
+        classId: student.class_id,
+        code: student.student_code,
+        displayName: student.display_name,
+        avatarEmoji: student.avatar_emoji,
+        avatarColor: student.avatar_color,
+      }));
+      router.push("/zak/profil");
+    })();
+  }, [searchParams, router]);
+
+  function handleCodeChange(value: string) {
+    const clean = value.replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 8);
+    setStudentCode(clean);
+    setError("");
+  }
+
+  function handleLessonCodeChange(value: string) {
+    const clean = value.replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 6);
+    setLessonCode(clean);
+    setError("");
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (studentCode.length !== 8) {
+      setError("Zadej 8místný osobní kód");
+      return;
+    }
+    setLoading(true);
+
+    const { data: student } = await supabase
+      .from("students")
+      .select("*, classes(*)")
+      .eq("student_code", studentCode)
+      .single();
+
+    if (!student) {
+      setError("Neplatný kód žáka");
+      setLoading(false);
+      return;
+    }
+
+    localStorage.setItem(
+      "inj-student",
+      JSON.stringify({
+        studentId: student.id,
+        classId: student.class_id,
+        code: student.student_code,
+        displayName: student.display_name,
+        avatarEmoji: student.avatar_emoji,
+        avatarColor: student.avatar_color,
+      })
+    );
+
+    router.push("/zak/profil");
+  }
+
+  async function handleLessonSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (lessonCode.length !== 6) {
+      setError("Zadej 6místný kód lekce");
+      return;
+    }
+
+    const stored = localStorage.getItem("inj-student");
+    if (!stored) {
+      setError("Nejprve zadej svůj osobní kód");
+      setShowLessonCode(false);
+      return;
+    }
+
+    setLoading(true);
+    const { studentId } = JSON.parse(stored);
+
+    const { data: session } = await supabase
+      .from("sessions")
+      .select("*")
+      .eq("code", lessonCode)
+      .eq("is_active", true)
+      .single();
+
+    if (!session) {
+      setError("Lekce nenalezena nebo není aktivní");
+      setLoading(false);
+      return;
+    }
+
+    localStorage.setItem(
+      "inj-session",
+      JSON.stringify({ sessionId: session.id, sessionCode: session.code })
+    );
+
+    router.push(`/lekce/${lessonCode}`);
+  }
+
+  return (
+    <main className="min-h-screen flex flex-col items-center justify-center p-8 bg-background">
+      <div className="flex flex-col items-center max-w-sm w-full">
+        <h1 className="text-5xl font-bold mb-2">
+          <span className="text-accent">Cesta inovátora</span>
+        </h1>
+        <p className="text-foreground/60 mb-12 text-lg">Přihlas se svým kódem</p>
+
+        <form onSubmit={handleSubmit} className="w-full flex flex-col items-center gap-6 animate-fade-in">
+          <div className="w-full">
+            <label htmlFor="student-code" className="block text-foreground/80 text-sm mb-2 text-center">
+              Tvůj osobní kód
+            </label>
+            <input
+              id="student-code"
+              type="text"
+              inputMode="text"
+              value={studentCode}
+              onChange={(e) => handleCodeChange(e.target.value)}
+              placeholder="ABCD1234"
+              className="w-full text-center text-3xl tracking-[0.3em] font-mono py-4 px-6 bg-background border-2 border-primary/50 focus:border-accent rounded-xl text-white outline-none transition-colors placeholder:text-foreground/20 uppercase"
+              autoFocus
             />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:min-w-44"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+          </div>
+          {error && !showLessonCode && <p className="text-red-400 text-sm text-center">{error}</p>}
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full py-4 bg-accent hover:bg-accent/80 disabled:opacity-50 text-background text-lg font-bold rounded-xl transition-colors"
           >
-            Read our docs
+            {loading ? "Ověřuji..." : "Přihlásit se"}
+          </button>
+        </form>
+
+        {/* Záložní vstup přes kód lekce */}
+        <div className="mt-8 w-full">
+          {!showLessonCode ? (
+            <button
+              onClick={() => setShowLessonCode(true)}
+              className="text-sm text-foreground/30 hover:text-foreground/50 transition-colors w-full text-center"
+            >
+              Mám kód lekce &rarr;
+            </button>
+          ) : (
+            <form onSubmit={handleLessonSubmit} className="animate-fade-in flex flex-col items-center gap-3">
+              <p className="text-foreground/50 text-sm">Zadej kód lekce od učitele</p>
+              <input
+                type="text"
+                inputMode="text"
+                value={lessonCode}
+                onChange={(e) => handleLessonCodeChange(e.target.value)}
+                placeholder="ABC123"
+                className="w-full text-center text-2xl tracking-[0.4em] font-mono py-3 px-6 bg-background border-2 border-primary/50 focus:border-accent rounded-xl text-white outline-none transition-colors placeholder:text-foreground/20 uppercase"
+              />
+              {error && showLessonCode && <p className="text-red-400 text-sm text-center">{error}</p>}
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full py-3 bg-primary hover:bg-primary/80 disabled:opacity-50 text-white font-semibold rounded-xl transition-colors"
+              >
+                Připojit se k lekci
+              </button>
+              <button
+                type="button"
+                onClick={() => { setShowLessonCode(false); setError(""); setLessonCode(""); }}
+                className="text-sm text-foreground/30 hover:text-foreground/50 transition-colors"
+              >
+                &larr; Zpět
+              </button>
+            </form>
+          )}
+        </div>
+
+        {/* Link pro učitele */}
+        <div className="mt-12">
+          <a href="/ucitel" className="text-foreground/20 text-xs hover:text-foreground/40 transition-colors">
+            Učitelský přístup
           </a>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-6 flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
-    </div>
+      </div>
+    </main>
   );
 }

@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/pavel/**)",
+      "Bash(npx create-next-app@14 inj-temp --typescript --tailwind --eslint --app --src-dir --no-import-alias --use-npm)",
+      "Bash(shopt -s dotglob)",
+      "Bash(cp -r /c/Users/pavel/inj-temp/* /c/Users/pavel/InJ/)",
+      "Bash(cp /c/Users/pavel/inj-temp/.eslintrc.json /c/Users/pavel/InJ/)",
+      "Bash(cp /c/Users/pavel/inj-temp/.gitignore /c/Users/pavel/InJ/)",
+      "Bash(rm -rf /c/Users/pavel/inj-temp)",
+      "Bash(cp -r /c/Users/pavel/inj-temp/package.json /c/Users/pavel/inj-temp/package-lock.json /c/Users/pavel/inj-temp/postcss.config.mjs /c/Users/pavel/inj-temp/tailwind.config.ts /c/Users/pavel/inj-temp/tsconfig.json /c/Users/pavel/InJ/)",
+      "Bash(cp -r /c/Users/pavel/inj-temp/src /c/Users/pavel/InJ/)",
+      "Bash(npm install:*)",
+      "Bash(npx next:*)",
+      "Bash(npm run:*)",
+      "Bash(curl -s http://localhost:3000)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000)",
+      "Bash(taskkill //F //IM node.exe)",
+      "Bash(grep -E \"\\\\.\\(env|example|md|json\\)$\")",
+      "Bash(rm:*)",
+      "Bash(rm -rf .next)",
+      "Bash(netstat -ano)",
+      "Bash(tasklist:*)",
+      "Bash(taskkill:*)",
+      "Bash(curl -s \"https://ggsccbdrvnfopmpirrsi.supabase.co/rest/v1/activities?id=eq.a1b2c3d4-e5f6-7890-abcd-ef1234567890&select=questions\" -H \"apikey: sb_publishable_28majVMXsTei4Dl8Rmxu7Q_wKQf9V8H\" -H \"Authorization: Bearer sb_publishable_28majVMXsTei4Dl8Rmxu7Q_wKQf9V8H\")",
+      "Bash(python -c \"import sys,json; data=json.load\\(sys.stdin\\); qs=data[0]['questions'] if data else []; [print\\(f\\\\\"{q['id']}: {q.get\\('assessment_mode','CHYBÍ'\\)}\\\\\"\\) for q in qs]\")",
+      "Bash(curl:*)",
+      "Bash(python -c \"import sys,json; [print\\(f\\\\\"{s['code']}: status={s['status']}, is_active={s['is_active']}, q={s['current_question']}\\\\\"\\) for s in json.load\\(sys.stdin\\)]\")",
+      "Bash(python -c \"import sys,json; [print\\(f\\\\\"{s['code']}: status={s['status']}, q={s['current_question']}\\\\\"\\) for s in json.load\\(sys.stdin\\)]\")",
+      "Bash(git clone:*)",
+      "Bash(npx tsc:*)",
+      "Bash(wc:*)",
+      "Bash(grep -n \"avatar_emoji\\\\|display_name\\\\|swot_profile\" C:/Users/pavel/InJ/supabase-schema.sql C:/Users/pavel/InJ/migration-v*.sql)"
+    ]
+  }
+}
