@@ -1,10 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 
-export default function Home() {
+export default function HomePage() {
+  return (
+    <Suspense fallback={<main className="min-h-screen flex items-center justify-center bg-background"><p className="text-foreground/60">Načítání...</p></main>}>
+      <Home />
+    </Suspense>
+  );
+}
+
+function Home() {
   const [studentCode, setStudentCode] = useState("");
   const [lessonCode, setLessonCode] = useState("");
   const [showLessonCode, setShowLessonCode] = useState(false);

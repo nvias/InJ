@@ -30,7 +30,8 @@
       "Bash(git clone:*)",
       "Bash(npx tsc:*)",
       "Bash(wc:*)",
-      "Bash(grep -n \"avatar_emoji\\\\|display_name\\\\|swot_profile\" C:/Users/pavel/InJ/supabase-schema.sql C:/Users/pavel/InJ/migration-v*.sql)"
+      "Bash(grep -n \"avatar_emoji\\\\|display_name\\\\|swot_profile\" C:/Users/pavel/InJ/supabase-schema.sql C:/Users/pavel/InJ/migration-v*.sql)",
+      "Bash(ls:*)"
     ]
   }
 }
