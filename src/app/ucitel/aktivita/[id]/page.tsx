@@ -8,6 +8,7 @@ import type { Activity, Question } from "@/types";
 import QuizDetail from "@/components/activity-details/QuizDetail";
 import TeamForgeDetail from "@/components/activity-details/TeamForgeDetail";
 import PitchDuelDetail from "@/components/activity-details/PitchDuelDetail";
+import MultiActivityDetail from "@/components/activity-details/MultiActivityDetail";
 
 export default function AktivitaDetailPage({ params }: { params: { id: string } }) {
   const [authorized, setAuthorized] = useState(false);
@@ -35,6 +36,7 @@ export default function AktivitaDetailPage({ params }: { params: { id: string } 
     quiz: { label: "Kvíz", color: "bg-accent/20 text-accent border-accent/40" },
     team_forge: { label: "Team Forge", color: "bg-purple-400/20 text-purple-300 border-purple-400/40" },
     pitch_duel: { label: "Pitch Duel", color: "bg-pink-400/20 text-pink-300 border-pink-400/40" },
+    multi_activity: { label: "Multi-aktivita", color: "bg-cyan-400/20 text-cyan-300 border-cyan-400/40" },
   };
   const badge = typeBadges[activity.type] || { label: activity.type, color: "bg-primary/20 text-foreground/50 border-primary/40" };
 
@@ -43,7 +45,7 @@ export default function AktivitaDetailPage({ params }: { params: { id: string } 
       <nav className="border-b border-primary/30 px-6 py-4">
         <div className="max-w-4xl mx-auto flex items-center justify-between">
           <Link href="/ucitel/dashboard" className="text-xl font-bold text-accent">Cesta inovátora</Link>
-          <Link href="/ucitel/dashboard" className="text-sm text-foreground/60 hover:text-foreground">&larr; Dashboard</Link>
+          <Link href="/ucitel/dashboard?tab=activities" className="text-sm text-foreground/60 hover:text-foreground">&larr; Knihovna lekcí</Link>
         </div>
       </nav>
 
@@ -66,7 +68,8 @@ export default function AktivitaDetailPage({ params }: { params: { id: string } 
         {/* Type-specific detail view */}
         {activity.type === "team_forge" && <TeamForgeDetail activity={activity} />}
         {activity.type === "pitch_duel" && <PitchDuelDetail activity={activity} />}
-        {(activity.type === "quiz" || !["team_forge", "pitch_duel"].includes(activity.type)) && (
+        {activity.type === "multi_activity" && <MultiActivityDetail activity={activity} />}
+        {(activity.type === "quiz" || !["team_forge", "pitch_duel", "multi_activity"].includes(activity.type)) && (
           <QuizDetail activity={activity} onUpdate={(qs: Question[]) => setActivity({ ...activity, questions: qs })} />
         )}
       </div>

@@ -7,7 +7,10 @@ export interface Class {
   created_at: string;
 }
 
-export type TeamRole = "leader" | "analyst" | "creative" | "mediator" | "executor";
+// Týmové role — preferenční taxonomie (žák si volí v aktivitě role_selection).
+// Nahrazuje původní behaviorální taxonomii (leader/analyst/creative/mediator/executor),
+// která nebyla v reálných flow používaná.
+export type TeamRole = "designer" | "engineer" | "communicator" | "innovator" | "manager";
 
 export interface SwotProfile {
   strengths: string[];
@@ -39,8 +42,153 @@ export interface Activity {
   competence_weights: Record<string, number>;
   team_size: number;             // 1=solo, 2=pair, 3=trio, ...
   requires_grouping: boolean;    // true => session starts in 'lobby' state
+  learning_goal?: string | null;
+  default_duration_min?: number | null;
+  assessment_mode?: AssessmentMode | null;
+  is_public?: boolean;
+  created_by?: string | null;
+  instructions?: string | null;
+  config?: ActivityConfig;
+  sub_activities?: SubActivity[];   // legacy: multi_activity JSONB
   created_at: string;
 }
+
+// Atomická aktivita ne-quiz typu má svoji konfiguraci v `config` JSONB.
+// Quiz pravidla zůstávají v questions[].
+export interface ActivityConfig {
+  // Quiz bonusy
+  xp_complete_bonus?: number;
+  xp_correct_phrasing_bonus?: number;
+  xp_growth_correction_bonus?: number;
+  // Open
+  min_items?: number;
+  max_items?: number;
+  event_type?: string;
+  ai_feedback?: boolean;
+  teacher_review?: boolean;
+  ai_check_criteria?: string;
+  skip_interpretation?: string;
+  xp_complete?: number;
+  // Peer review
+  anonymize?: boolean;
+  votes_per_student?: number;
+  select_top_n?: number;
+  source_activity_id?: string;
+  result?: string;
+  // Photo upload / group_work
+  deliverable?: {
+    type: "photo_upload" | "video_upload";
+    min_photos?: number;
+    max_photos?: number;
+    required: boolean;
+    description?: string;
+  };
+  ai_verification?: {
+    enabled: boolean;
+    checks?: string[];
+    prompt?: string;
+  };
+  team_size_hint?: number;
+  // Volné rozšíření
+  [key: string]: unknown;
+}
+
+// ---- Lekce (kontejner aktivit) ----
+
+export interface Lesson {
+  id: string;
+  title: string;
+  description: string | null;
+  lesson_number: number | null;
+  phase: number | null;
+  total_duration_min: number | null;
+  learning_goal: string | null;
+  is_published: boolean;
+  created_by: string | null;
+  created_at: string;
+}
+
+export interface LessonActivity {
+  id: string;
+  lesson_id: string;
+  activity_id: string;
+  order_index: number;
+  is_optional: boolean;
+  custom_duration_min: number | null;
+  teacher_note: string | null;
+  /** ID jiných lesson_activities (ze stejné lekce), které tato aktivita vyžaduje. */
+  requires_lesson_activity_ids: string[];
+  created_at: string;
+}
+
+// In-memory: položka editoru lekce (LessonActivity + hydratovaná Activity)
+export interface LessonActivityWithActivity extends LessonActivity {
+  activity: Activity;
+}
+
+// ---- Multi-activity sub-steps ----
+
+export type SubActivityType = "quiz" | "open" | "peer_review" | "group_work";
+
+interface BaseSubActivity {
+  order: number;
+  id: string;
+  title: string;
+  description?: string;
+  duration_min?: number;
+  competence_weights?: Record<string, number>;
+}
+
+export interface QuizSubActivity extends BaseSubActivity {
+  type: "quiz";
+  assessment_mode?: AssessmentMode;
+  questions: Question[];
+  xp_complete_bonus?: number;
+  xp_correct_phrasing_bonus?: number;
+  xp_growth_correction_bonus?: number;
+}
+
+export interface OpenSubActivity extends BaseSubActivity {
+  type: "open";
+  instructions?: string;
+  min_items: number;
+  max_items: number;
+  event_type?: string;
+  ai_feedback?: boolean;
+  teacher_review?: boolean;
+  skip_interpretation?: string;
+  xp_complete?: number;
+}
+
+export interface PeerReviewSubActivity extends BaseSubActivity {
+  type: "peer_review";
+  anonymize?: boolean;
+  votes_per_student: number;
+  select_top_n?: number;
+  source_activity_id?: string;
+  xp_complete?: number;
+}
+
+export interface GroupWorkSubActivity extends BaseSubActivity {
+  type: "group_work";
+  instructions?: string;
+  deliverable: {
+    type: "photo_upload";
+    min_photos: number;
+    max_photos: number;
+    required: boolean;
+    description?: string;
+  };
+  ai_verification?: {
+    enabled: boolean;
+    checks?: string[];
+    prompt?: string;
+  };
+  teacher_review?: boolean;
+  xp_complete?: number;
+}
+
+export type SubActivity = QuizSubActivity | OpenSubActivity | PeerReviewSubActivity | GroupWorkSubActivity;
 
 export type ActivityMode = "learning" | "assessment" | "mixed";
 export type SessionStatus = "lobby" | "active" | "paused" | "closed";
@@ -77,7 +225,11 @@ export interface GroupWithMembers {
 export interface Session {
   id: string;
   class_id: string;
-  activity_id: string;
+  activity_id: string;                          // legacy single-activity ref (vždy vyplněno)
+  lesson_id: string | null;                     // nový dvouúrovňový flow (NULL = starý single-activity)
+  current_activity_index: number;               // index v lesson_activities (jen pokud lesson_id)
+  completed_activity_ids: string[];             // UUID dokončených aktivit
+  skipped_activity_ids: string[];               // lesson_activity.id přeskočené pro tuto session
   code: string;
   is_active: boolean;
   status: SessionStatus;
@@ -175,27 +327,55 @@ export const GROWTH_WRONG_MSGS = [
 
 export const GROWTH_SKIP_MSG = "Přeskočeno, vrátíme se k tomu";
 export const GROWTH_TIMEOUT_MSG = "Čas vypršel!";
-export const GROWTH_ASSESSMENT_MSG = "Odpověď zaznamenána";
+export const GROWTH_ASSESSMENT_MSG = "Odpověď uložena ✓";
+
+// Dual-skill primary messages (krátké, hlavní, vždy stejné)
+export const SKILL_MSG_PRESNOST = "💎 Přesná odpověď! Skill Přesnost +1";
+export const SKILL_MSG_PRACE_S_CHYBOU = "🔄 Skvělá oprava! Skill Práce s chybou +1";
+export const SKILL_MSG_WRONG = "Příště to zkus znovu 💪";
 
 // ---- Team Role Labels ----
 
-export const TEAM_ROLE_INFO: Record<TeamRole, { label: string; emoji: string; description: string }> = {
-  leader: { label: "Vůdce", emoji: "👑", description: "Přirozeně přebíráš iniciativu a organizuješ ostatní" },
-  analyst: { label: "Analytik", emoji: "🔍", description: "Přemýšlíš do hloubky a opravuješ chyby" },
-  creative: { label: "Kreativec", emoji: "💡", description: "Přicházíš s originálními nápady" },
-  mediator: { label: "Mediátor", emoji: "🤝", description: "Pomáháš najít shodu a podporuješ ostatní" },
-  executor: { label: "Realizátor", emoji: "⚡", description: "Spolehlivě dokončuješ úkoly" },
+export const TEAM_ROLE_INFO: Record<TeamRole, { label: string; emoji: string; description: string; tagline: string }> = {
+  designer:     { label: "Designér",    emoji: "🎨", tagline: "Mám rád vizuál a kreativitu",       description: "Rád vymýšlíš jak věci vypadají a působí na lidi" },
+  engineer:     { label: "Technik",     emoji: "⚙️", tagline: "Mám rád analýzu a realizaci",       description: "Rád promýšlíš jak něco funguje a doděláš to do konce" },
+  communicator: { label: "Komunikátor", emoji: "📢", tagline: "Mám rád prezentování a diplomacii", description: "Rád mluvíš s lidmi a vysvětluješ nápady ostatním" },
+  innovator:    { label: "Inovátor",    emoji: "💡", tagline: "Mám rád nápady a vize",             description: "Rád přicházíš s úplně novými nápady" },
+  manager:      { label: "Manažer",     emoji: "📋", tagline: "Mám rád organizaci a plánování",    description: "Rád organizuješ tým a držíš harmonogram" },
 };
 
-// ---- Scoring helpers ----
+export const ALL_TEAM_ROLES: TeamRole[] = ["designer", "engineer", "communicator", "innovator", "manager"];
 
-export function calcXp(mode: AssessmentMode, isCorrect: boolean, attemptNo: number, durationMs: number): number {
-  if (mode === "assessment") {
-    return isCorrect ? 100 : 0;
-  }
-  if (isCorrect && attemptNo > 1) return 100;
-  if (isCorrect && attemptNo === 1) return durationMs > 10000 ? 90 : 85;
-  return 20;
+// ---- Scoring helpers (dual-skill systém) ----
+//
+// XP body jsou VŽDY stejné — rozdíl mezi „správně napoprvé" a „chyba → oprava"
+// se projeví v nezávislých skill counterech, ne v bodech:
+//   • skill_presnost          ← správně napoprvé
+//   • skill_prace_s_chybou    ← chyba → oprava → správně
+//
+// V assessment módu funguje stejné bodování, jen žák vidí výsledky až po dokončení testu.
+
+export const XP_CORRECT_FIRST_TRY = 100;
+export const XP_CORRECTED = 100;     // chyba → oprava
+export const XP_WRONG = 30;           // pokus se počítá
+
+export type AnswerOutcome = "correct_first" | "corrected" | "wrong";
+
+export function classifyOutcome(isCorrect: boolean, attemptNo: number): AnswerOutcome {
+  if (isCorrect && attemptNo === 1) return "correct_first";
+  if (isCorrect && attemptNo > 1) return "corrected";
+  return "wrong";
+}
+
+export function calcXp(_mode: AssessmentMode, isCorrect: boolean, attemptNo: number, _durationMs: number): number {
+  // mode i durationMs ponechány v signatuře pro zpětnou kompatibilitu — nový dual-skill systém
+  // je nepoužívá. Tip pro lint: eslint je vypnutý při buildu.
+  void _mode;
+  void _durationMs;
+  const outcome = classifyOutcome(isCorrect, attemptNo);
+  if (outcome === "correct_first") return XP_CORRECT_FIRST_TRY;
+  if (outcome === "corrected") return XP_CORRECTED;
+  return XP_WRONG;
 }
 
 export function getQuestionMode(sessionMode: ActivityMode, question: Question): AssessmentMode {
@@ -203,34 +383,52 @@ export function getQuestionMode(sessionMode: ActivityMode, question: Question): 
   return sessionMode === "assessment" ? "assessment" : "learning";
 }
 
+// Compute skill counters from a list of best events per question.
+// Vstup: pole "best" eventů (po deduplikaci podle question_id).
+export function computeSkillCounters(events: Array<{ is_correct: boolean; attempt_no: number }>): {
+  presnost: number;
+  prace_s_chybou: number;
+} {
+  let presnost = 0;
+  let praceSChybou = 0;
+  for (const ev of events) {
+    if (ev.is_correct && ev.attempt_no === 1) presnost++;
+    else if (ev.is_correct && ev.attempt_no > 1) praceSChybou++;
+  }
+  return { presnost, prace_s_chybou: praceSChybou };
+}
+
+// Mapping skill → kompetence (pro reporting)
+export const SKILL_TO_COMPETENCE = {
+  presnost: "rvp_reseni_problemu",
+  prace_s_chybou: "entrecomp_learning_through_experience",
+} as const;
+
 // Pick a random message from array, deterministic by seed
 export function pickMessage(messages: string[], seed: number): string {
   return messages[seed % messages.length];
 }
 
-// Detect team role from behavioral data
-export function detectTeamRole(stats: {
-  avgResponseTime: number;
-  correctionRate: number; // % of wrong→correct
-  skipRate: number;
-  firstResponder: number; // how often answered first
-}): { role: TeamRole; confidence: number } {
-  const scores: Record<TeamRole, number> = {
-    leader: stats.firstResponder * 0.6 + (1 - stats.avgResponseTime / 30000) * 0.4,
-    analyst: stats.correctionRate * 0.5 + (stats.avgResponseTime / 30000) * 0.5,
-    creative: stats.correctionRate * 0.3 + (1 - stats.skipRate) * 0.3 + 0.4 * Math.random(),
-    mediator: stats.skipRate * 0.3 + (1 - stats.firstResponder) * 0.4 + stats.avgResponseTime / 30000 * 0.3,
-    executor: (1 - stats.skipRate) * 0.5 + (1 - stats.correctionRate) * 0.3 + (stats.avgResponseTime < 15000 ? 0.2 : 0),
-  };
+// Detekce týmové role z behaviorálních dat — REMOVED.
+// Původní mapping na leader/analyst/creative/mediator/executor; nahrazeno preferenční
+// taxonomií (designer/engineer/communicator/innovator/manager) volenou žákem v aktivitě role_selection.
 
-  let bestRole: TeamRole = "executor";
-  let bestScore = 0;
-  for (const [role, score] of Object.entries(scores)) {
-    if (score > bestScore) {
-      bestRole = role as TeamRole;
-      bestScore = score;
-    }
-  }
-
-  return { role: bestRole, confidence: Math.min(bestScore, 1) };
+// ─────────────────────────────────────────────
+// Team (sestavený tým z aktivity team_assembly)
+// ─────────────────────────────────────────────
+export interface Team {
+  id: string;
+  session_id: string;
+  lesson_id: string | null;
+  activity_id: string | null;
+  opportunity_text: string;
+  source_event_id: string | null;
+  leader_student_id: string;
+  member_ids: string[];
+  roles_summary: Partial<Record<TeamRole, number>>;
+  is_leader_confirmed: boolean;
+  is_approved: boolean;
+  approved_by: string | null;
+  approved_at: string | null;
+  created_at: string;
 }

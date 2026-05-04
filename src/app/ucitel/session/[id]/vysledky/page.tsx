@@ -4,11 +4,13 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
-import type { Question, StudentEvent, ActivityMode } from "@/types";
+import type { Question, StudentEvent, ActivityMode, Activity } from "@/types";
 import { calcXp as calcXpFn, getQuestionMode } from "@/types";
+import { isQuizLikeActivity } from "@/lib/lesson-adapters";
 import TeamForgeTeacherView from "@/components/TeamForgeTeacherView";
 import PitchDuelTeacherView from "@/components/PitchDuelTeacherView";
 import GroupingLobby from "@/components/GroupingLobby";
+import TeamAssemblyTeacherPanel from "@/components/TeamAssemblyTeacherPanel";
 
 
 interface StudentResult {
@@ -58,6 +60,15 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
   const [timerSeconds, setTimerSeconds] = useState<number | null>(null);
   const [timeLeft, setTimeLeft] = useState(0);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  // Lesson-mode state: učitel vidí progress lekce + tlačítko "Spustit další aktivitu"
+  const [lessonId, setLessonId] = useState<string | null>(null);
+  const [lessonTitle, setLessonTitle] = useState<string>("");
+  const [lessonActivities, setLessonActivities] = useState<Activity[]>([]);
+  const [currentActivityIdx, setCurrentActivityIdx] = useState(0);
+  const [submissionCount, setSubmissionCount] = useState(0);
+  const [allTeamsApproved, setAllTeamsApproved] = useState(false);
+  const [lessonActivityIds, setLessonActivityIds] = useState<string[]>([]);
+  const [skippedLaIds, setSkippedLaIds] = useState<Set<string>>(new Set());
   const [resetting, setResetting] = useState(false);
   const router = useRouter();
   const isActiveRef = useRef(true);
@@ -87,14 +98,44 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
     const dbQ = session.current_question ?? 0;
     setCurrentQuestion(dbQ);
     currentQuestionRef.current = dbQ;
-    const activity = session.activities as { title: string; questions: Question[]; type?: string; team_size?: number; requires_grouping?: boolean };
+
+    // LESSON MODE — pokud je session.lesson_id, current activity bereme z lesson_activities[idx],
+    // ne ze session.activities (legacy column tam pořád ukazuje na první/uloženou aktivitu).
+    let activity = session.activities as { title: string; questions: Question[]; type?: string; team_size?: number; requires_grouping?: boolean };
+    const sessLessonId = (session as { lesson_id?: string | null }).lesson_id ?? null;
+    const curActIdx = (session as { current_activity_index?: number }).current_activity_index ?? 0;
+    setLessonId(sessLessonId);
+    setCurrentActivityIdx(curActIdx);
+    if (sessLessonId) {
+      const [{ data: lRow }, { data: laRows }] = await Promise.all([
+        supabase.from("lessons").select("title").eq("id", sessLessonId).single(),
+        supabase
+          .from("lesson_activities")
+          .select("id, activity:activities(*)")
+          .eq("lesson_id", sessLessonId)
+          .order("order_index", { ascending: true }),
+      ]);
+      setLessonTitle(lRow?.title ?? "");
+      const rows = (laRows ?? []) as unknown as Array<{ id: string; activity: Activity }>;
+      const acts = rows.map((r) => r.activity).filter(Boolean);
+      const ids = rows.map((r) => r.id);
+      setLessonActivities(acts);
+      setLessonActivityIds(ids);
+      const skippedArr = (session as { skipped_activity_ids?: string[] }).skipped_activity_ids ?? [];
+      setSkippedLaIds(new Set(Array.isArray(skippedArr) ? skippedArr : []));
+      const curAct = acts[curActIdx];
+      if (curAct) {
+        activity = curAct as unknown as typeof activity;
+      }
+    }
+
     setActivityTitle(activity.title);
     setActivityType(activity.type || "quiz");
     setActivityTeamSize(activity.team_size || 1);
     setActivityRequiresGrouping(activity.requires_grouping || false);
     setSessionStatus(session.status || (session.is_active ? "active" : "closed"));
     setSessionClassId(session.class_id || "");
-    setQuestions(activity.questions);
+    setQuestions(activity.questions ?? []);
 
     const { data: students } = await supabase
       .from("students")
@@ -116,6 +157,18 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
 
     // Filter out join/skip events for scoring
     const answerEvts = evts.filter((e) => e.event_type === "answer");
+
+    // Lesson mode: count submissions for non-quiz activities (text/photo/peer-rating per current activity)
+    if (sessLessonId && activity.type && !isQuizLikeActivity(activity.type)) {
+      const subEvts = evts.filter((e) =>
+        ["text_submit", "photo_upload", "peer_rating", "activity_complete"].includes(e.event_type) &&
+        e.question_id === (activity as Activity).id
+      );
+      const uniqueSubmitters = new Set(subEvts.map((e) => e.student_id));
+      setSubmissionCount(uniqueSubmitters.size);
+    } else {
+      setSubmissionCount(0);
+    }
 
     // Per-student results
     const results: StudentResult[] = [];
@@ -354,6 +407,41 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
     setTimeout(() => { pendingActionRef.current = false; }, 1000);
   }
 
+  async function handleNextLessonActivity() {
+    setAdvancing(true);
+    pendingActionRef.current = true;
+    // Najdi další ne-skipped aktivitu
+    let next = currentActivityIdx + 1;
+    while (next < lessonActivities.length && skippedLaIds.has(lessonActivityIds[next])) {
+      next++;
+    }
+    if (next >= lessonActivities.length) {
+      // Poslední aktivita dokončena → uzavři session
+      await supabase.from("sessions").update({ is_active: false, status: "closed" }).eq("id", params.id);
+      setIsActive(false);
+      isActiveRef.current = false;
+    } else {
+      const nextAct = lessonActivities[next];
+      // Pokud nová aktivita vyžaduje skupiny → spustí se lobby fáze (učitel rozdělí žáky)
+      const newStatus = nextAct.requires_grouping ? "lobby" : "active";
+      await supabase.from("sessions").update({
+        current_activity_index: next,
+        current_question: 0,
+        answering_open: true,
+        activity_id: nextAct.id,                  // legacy column v sync
+        status: newStatus,
+      }).eq("id", params.id);
+      setCurrentActivityIdx(next);
+      setCurrentQuestion(0);
+      currentQuestionRef.current = 0;
+      setAnsweringOpen(true);
+      setSessionStatus(newStatus);
+    }
+    setAdvancing(false);
+    setTimeout(() => { pendingActionRef.current = false; }, 1000);
+    loadResults();
+  }
+
   async function handleEndLesson() {
     pendingActionRef.current = true;
     await supabase
@@ -456,6 +544,12 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
   const answeredCurrent = currentQStat?.totalAnswers ?? 0;
   const maxBar = Math.max(...questionStats.map((q) => q.totalAnswers), 1);
 
+  // Assessment módu během běžícího testu skryjeme správnost a leaderboard.
+  // Zobrazí se až po ukončení (isActive=false / status=closed).
+  const hideResults = activityMode === "assessment" && isActive;
+  // Počet žáků, kteří dokončili VŠECHNY otázky aktuální aktivity (relevantní v assessment módu)
+  const completedAll = studentResults.filter((s) => s.total >= questions.length).length;
+
   // Kahoot-style option colors
   const optionColors: Record<string, { bg: string; bar: string }> = {
     A: { bg: "bg-red-500", bar: "bg-red-500" },
@@ -479,6 +573,15 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
         {/* Header */}
         <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
           <div>
+            {lessonId && (() => {
+              const visibleIds = lessonActivityIds.filter((id) => !skippedLaIds.has(id));
+              const visiblePos = lessonActivityIds.slice(0, currentActivityIdx + 1).filter((id) => !skippedLaIds.has(id)).length;
+              return (
+                <div className="text-xs uppercase tracking-wider text-foreground/40 mb-1">
+                  Lekce: <span className="text-accent">{lessonTitle}</span> · aktivita {visiblePos}/{visibleIds.length}
+                </div>
+              );
+            })()}
             <h1 className="text-3xl font-bold text-white mb-1">{activityTitle}</h1>
             <div className="flex items-center gap-4">
               <span className="font-mono text-2xl text-accent tracking-wider">{sessionCode}</span>
@@ -512,6 +615,58 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
           </div>
         </div>
 
+        {/* Assessment banner — žák během testu nevidí výsledky, ani učitel kromě completion countu */}
+        {hideResults && (
+          <div className="mb-6 bg-purple-400/10 border border-purple-400/30 rounded-xl p-4 flex items-center gap-3">
+            <span className="text-2xl">📊</span>
+            <div className="flex-1">
+              <p className="text-purple-200 font-bold text-sm">Test probíhá</p>
+              <p className="text-purple-200/70 text-xs">
+                {completedAll}/{connectedStudents} žáků dokončilo · správnost odpovědí uvidíš po ukončení testu
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Lesson progress bar (only in lesson mode) — skipped aktivity vynechány */}
+        {lessonId && lessonActivities.length > 0 && (() => {
+          const visible = lessonActivities
+            .map((a, i) => ({ a, i, laId: lessonActivityIds[i] }))
+            .filter((x) => !skippedLaIds.has(x.laId));
+          const skippedCount = lessonActivities.length - visible.length;
+          return (
+            <div className="mb-6 bg-primary/5 border border-primary/20 rounded-xl p-4">
+              <div className="flex items-center justify-between mb-3 text-xs text-foreground/50">
+                <span>Postup lekcí{skippedCount > 0 ? ` (${skippedCount} přeskočeno)` : ""}:</span>
+              </div>
+              <div className="flex items-center gap-2">
+                {visible.map((x, vi) => {
+                  const done = x.i < currentActivityIdx;
+                  const active = x.i === currentActivityIdx;
+                  return (
+                    <div key={x.a.id} className="flex-1 flex items-center gap-2 min-w-0">
+                      <div
+                        className={`flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all ${
+                          done
+                            ? "bg-accent text-background"
+                            : active
+                            ? "bg-accent/20 text-accent border-2 border-accent"
+                            : "bg-primary/20 text-foreground/40 border-2 border-primary/30"
+                        }`}
+                        title={x.a.title}
+                      >
+                        {done ? "✓" : vi + 1}
+                      </div>
+                      <span className={`text-xs truncate ${active ? "text-white font-medium" : "text-foreground/40"}`}>{x.a.title}</span>
+                      {vi < visible.length - 1 && <div className={`flex-1 h-0.5 ${done ? "bg-accent" : "bg-primary/20"}`} />}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
+
         {/* Reset confirm modal */}
         {showResetConfirm && (
           <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
@@ -537,8 +692,47 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
           </div>
         )}
 
-        {/* Teacher control panel */}
-        {isActive && (
+        {/* Non-quiz lesson activity — zjednodušený panel s počtem odevzdání + tlačítkem na další aktivitu */}
+        {isActive && lessonId && !isQuizLikeActivity(activityType) && (
+          <div className="mb-8 border-2 border-accent/30 rounded-2xl p-6 bg-accent/5">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-4">
+              <div>
+                <h2 className="text-lg font-bold text-white">{activityTitle}</h2>
+                <p className="text-foreground/50 text-sm mt-1">
+                  {connectedStudents} žáků připojeno
+                  {activityType === "team_assembly"
+                    ? ""
+                    : ` · ${submissionCount} odevzdalo`}
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <Link
+                  href={`/ucitel/session/${params.id}/prezentace`}
+                  target="_blank"
+                  className="px-4 py-3 bg-primary/30 text-foreground/70 hover:text-white hover:bg-primary/50 rounded-xl transition-colors text-sm font-medium"
+                >
+                  Prezentace ↗
+                </Link>
+                <button
+                  onClick={handleNextLessonActivity}
+                  disabled={advancing || (activityType === "team_assembly" && !allTeamsApproved)}
+                  title={activityType === "team_assembly" && !allTeamsApproved ? "Nejdřív schval všechny týmy" : ""}
+                  className="px-6 py-3 bg-accent hover:bg-accent/80 disabled:opacity-50 disabled:cursor-not-allowed text-background font-bold rounded-xl transition-colors text-lg"
+                >
+                  {currentActivityIdx + 1 >= lessonActivities.length ? "Dokončit lekci" : "Spustit další aktivitu →"}
+                </button>
+              </div>
+            </div>
+
+            {/* Team assembly: panel se schvalováním týmů */}
+            {activityType === "team_assembly" && (
+              <TeamAssemblyTeacherPanel sessionId={params.id} onAllApproved={setAllTeamsApproved} />
+            )}
+          </div>
+        )}
+
+        {/* Teacher control panel — quiz Kahoot UI (skip pro non-quiz lesson aktivity) */}
+        {isActive && (!lessonId || isQuizLikeActivity(activityType)) && (
           <div className="mb-8 border-2 border-accent/30 rounded-2xl p-6 bg-accent/5">
             <div className="flex items-center justify-between mb-4">
               <div>
@@ -558,7 +752,7 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
                 <div className="flex items-center gap-3">
                   {/* Prezentace - otevře nový tab */}
                   <Link
-                    href={`/ucitel/lekce/${params.id}/prezentace`}
+                    href={`/ucitel/session/${params.id}/prezentace`}
                     target="_blank"
                     className="px-4 py-3 bg-primary/30 text-foreground/70 hover:text-white hover:bg-primary/50 rounded-xl transition-colors text-sm font-medium"
                   >
@@ -586,16 +780,32 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
                       Otevřít odpovědi
                     </button>
                   )}
-                  <button
-                    onClick={handleNextQuestion}
-                    disabled={advancing}
-                    className="px-6 py-3 bg-accent hover:bg-accent/80 disabled:opacity-50 text-background font-bold rounded-xl transition-colors text-lg"
-                  >
-                    {currentQuestion + 1 >= questions.length
-                      ? "Dokončit kvíz"
-                      : `Další → Otázka ${currentQuestion + 2}`
+                  {(() => {
+                    const isLastQ = currentQuestion + 1 >= questions.length;
+                    const inLesson = !!lessonId;
+                    const isLastActivity = currentActivityIdx + 1 >= lessonActivities.length;
+                    // V lekci: poslední otázka aktivity → spustit další aktivitu (nebo ukončit lekci)
+                    if (inLesson && isLastQ) {
+                      return (
+                        <button
+                          onClick={handleNextLessonActivity}
+                          disabled={advancing}
+                          className="px-6 py-3 bg-accent hover:bg-accent/80 disabled:opacity-50 text-background font-bold rounded-xl transition-colors text-lg"
+                        >
+                          {isLastActivity ? "Dokončit lekci" : "Spustit další aktivitu →"}
+                        </button>
+                      );
                     }
-                  </button>
+                    return (
+                      <button
+                        onClick={handleNextQuestion}
+                        disabled={advancing}
+                        className="px-6 py-3 bg-accent hover:bg-accent/80 disabled:opacity-50 text-background font-bold rounded-xl transition-colors text-lg"
+                      >
+                        {isLastQ ? "Dokončit kvíz" : `Další → Otázka ${currentQuestion + 2}`}
+                      </button>
+                    );
+                  })()}
                 </div>
               )}
             </div>
@@ -610,7 +820,7 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
                 </div>
                 <p className="text-white font-medium mb-4">{currentQData.text}</p>
 
-                {/* Kahoot-style option bars */}
+                {/* Kahoot-style option bars (v assessment módu zatajíme správnou odpověď + counts) */}
                 <div className="grid grid-cols-2 gap-3">
                   {currentQData.options.map((opt) => {
                     const count = currentQStat?.optionCounts?.[opt.key] ?? 0;
@@ -623,16 +833,18 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
                       <div
                         key={opt.key}
                         className={`relative py-3 px-4 rounded-xl border-2 transition-all ${
-                          isCorrect
+                          !hideResults && isCorrect
                             ? "border-green-400/50 bg-green-400/5"
                             : "border-primary/20 bg-primary/5"
                         }`}
                       >
-                        {/* Background fill bar */}
-                        <div
-                          className={`absolute inset-0 rounded-xl opacity-15 ${colors.bar} transition-all duration-700`}
-                          style={{ width: `${pct}%` }}
-                        />
+                        {/* Background fill bar — skryjeme v assessment módu (žádný hint kdo co odpovídá) */}
+                        {!hideResults && (
+                          <div
+                            className={`absolute inset-0 rounded-xl opacity-15 ${colors.bar} transition-all duration-700`}
+                            style={{ width: `${pct}%` }}
+                          />
+                        )}
                         <div className="relative flex items-center justify-between">
                           <div className="flex items-center gap-2">
                             <span className={`w-7 h-7 rounded-lg ${colors.bg} flex items-center justify-center text-white font-bold text-sm`}>
@@ -640,17 +852,19 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
                             </span>
                             <span className="text-white text-sm">{opt.text}</span>
                           </div>
-                          <span className="text-foreground/60 font-bold text-sm ml-2">
-                            {count > 0 ? count : ""}
-                          </span>
+                          {!hideResults && (
+                            <span className="text-foreground/60 font-bold text-sm ml-2">
+                              {count > 0 ? count : ""}
+                            </span>
+                          )}
                         </div>
                       </div>
                     );
                   })}
                 </div>
 
-                {/* Who answered what */}
-                {currentQStat && currentQStat.totalAnswers > 0 && (
+                {/* Who answered what — v assessment módu skryto, jinak detail */}
+                {!hideResults && currentQStat && currentQStat.totalAnswers > 0 && (
                   <div className="mt-4 pt-3 border-t border-primary/20">
                     <p className="text-foreground/40 text-xs mb-2">Odpovědi žáků:</p>
                     <div className="flex flex-wrap gap-1.5">
@@ -681,7 +895,7 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
             )}
 
             {/* Top 5 summary when answering is closed */}
-            {!answeringOpen && !isFinished && studentResults.length > 0 && (
+            {!hideResults && !answeringOpen && !isFinished && studentResults.length > 0 && (
               <div className="mt-4 p-4 bg-primary/10 rounded-xl border border-primary/20">
                 <h3 className="text-sm font-bold text-foreground/50 uppercase tracking-wider mb-3">Top 5 hráčů</h3>
                 <div className="flex flex-col gap-2">
@@ -733,28 +947,44 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
             <p className="text-3xl font-bold text-white">{questions.length}</p>
             <p className="text-foreground/50 text-sm">Otázek</p>
           </div>
-          <div className="border border-primary/30 rounded-xl p-4 text-center">
-            <p className="text-3xl font-bold text-green-400">
-              {questionStats.length > 0
-                ? Math.round(
-                    (questionStats.reduce((s, q) => s + q.correctFirst + q.correctSecond, 0) /
-                      Math.max(questionStats.reduce((s, q) => s + q.totalAnswers, 0), 1)) *
-                      100
-                  )
-                : 0}
-              %
-            </p>
-            <p className="text-foreground/50 text-sm">Správně celkem</p>
-          </div>
-          <div className="border border-primary/30 rounded-xl p-4 text-center">
-            <p className="text-3xl font-bold text-yellow-400">
-              {studentResults.filter((s) => s.consecutiveWrong >= 2).length}
-            </p>
-            <p className="text-foreground/50 text-sm">Potřebuje podporu</p>
-          </div>
+          {hideResults ? (
+            <>
+              <div className="border border-purple-400/30 rounded-xl p-4 text-center">
+                <p className="text-3xl font-bold text-purple-300">{completedAll}</p>
+                <p className="text-foreground/50 text-sm">Dokončilo test</p>
+              </div>
+              <div className="border border-primary/30 rounded-xl p-4 text-center">
+                <p className="text-3xl font-bold text-foreground/30">—</p>
+                <p className="text-foreground/50 text-sm">Hodnocení po skončení</p>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="border border-primary/30 rounded-xl p-4 text-center">
+                <p className="text-3xl font-bold text-green-400">
+                  {questionStats.length > 0
+                    ? Math.round(
+                        (questionStats.reduce((s, q) => s + q.correctFirst + q.correctSecond, 0) /
+                          Math.max(questionStats.reduce((s, q) => s + q.totalAnswers, 0), 1)) *
+                          100
+                      )
+                    : 0}
+                  %
+                </p>
+                <p className="text-foreground/50 text-sm">Správně celkem</p>
+              </div>
+              <div className="border border-primary/30 rounded-xl p-4 text-center">
+                <p className="text-3xl font-bold text-yellow-400">
+                  {studentResults.filter((s) => s.consecutiveWrong >= 2).length}
+                </p>
+                <p className="text-foreground/50 text-sm">Potřebuje podporu</p>
+              </div>
+            </>
+          )}
         </div>
 
-        {/* Question stats */}
+        {/* Question stats — skip pro non-quiz lesson aktivity (nemá otázky) a v assessment módu během testu */}
+        {questions.length > 0 && !hideResults && (
         <section className="border border-primary/30 rounded-xl p-6 mb-8">
           <h2 className="text-xl font-semibold text-accent mb-4">Přehled otázek</h2>
           <div className="flex flex-col gap-3">
@@ -793,6 +1023,7 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
             })}
           </div>
         </section>
+        )}
 
         {/* Student table */}
         <section className="border border-primary/30 rounded-xl p-6">
@@ -805,19 +1036,30 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
                 <thead>
                   <tr className="border-b border-primary/20">
                     <th className="py-2 px-3 text-left text-foreground/50">Žák</th>
-                    <th className="py-2 px-3 text-left text-foreground/50">Skóre</th>
+                    {!hideResults && (
+                      <>
+                        <th className="py-2 px-3 text-left text-foreground/50">Skill 💎</th>
+                        <th className="py-2 px-3 text-left text-foreground/50">Skill 🔄</th>
+                        <th className="py-2 px-3 text-left text-foreground/50">Skóre</th>
+                      </>
+                    )}
                     <th className="py-2 px-3 text-left text-foreground/50">Čas</th>
-                    <th className="py-2 px-3 text-left text-foreground/50">Pokusy</th>
                     <th className="py-2 px-3 text-left text-foreground/50">Stav</th>
                   </tr>
                 </thead>
                 <tbody>
                   {studentResults.map((sr) => {
-                    const pct = sr.total > 0 ? Math.round((sr.score / sr.total) * 100) : 0;
                     const needsHelp = sr.consecutiveWrong >= 2;
+                    // Skill counters z dual-skill systému
+                    let presnost = 0;
+                    let praceSChybou = 0;
+                    for (const ans of Array.from(sr.answers.values())) {
+                      if (ans.isCorrect && ans.attemptNo === 1) presnost++;
+                      else if (ans.isCorrect && ans.attemptNo > 1) praceSChybou++;
+                    }
 
                     return (
-                      <tr key={sr.studentId} className={`border-b border-primary/10 ${needsHelp ? "bg-red-400/5" : ""}`}>
+                      <tr key={sr.studentId} className={`border-b border-primary/10 ${!hideResults && needsHelp ? "bg-red-400/5" : ""}`}>
                         <td className="py-2 px-3">
                           <div className="flex items-center gap-2">
                             <span className="text-lg">{sr.avatarEmoji}</span>
@@ -827,14 +1069,29 @@ export default function VysledkyPage({ params }: { params: { id: string } }) {
                             </div>
                           </div>
                         </td>
-                        <td className="py-2 px-3">
-                          <span className="font-bold text-accent">{sr.xp} XP</span>
-                          <span className="text-foreground/40 ml-1">({sr.score}/{sr.total})</span>
-                        </td>
+                        {!hideResults && (
+                          <>
+                            <td className="py-2 px-3">
+                              <span className="text-cyan-300 font-bold">💎 {presnost}</span>
+                            </td>
+                            <td className="py-2 px-3">
+                              <span className="text-purple-300 font-bold">🔄 {praceSChybou}</span>
+                            </td>
+                            <td className="py-2 px-3">
+                              <span className="font-bold text-accent">{sr.xp} XP</span>
+                              <span className="text-foreground/40 ml-1">({sr.score}/{sr.total})</span>
+                            </td>
+                          </>
+                        )}
                         <td className="py-2 px-3 text-foreground/60">{Math.round(sr.totalTime / 1000)}s</td>
-                        <td className="py-2 px-3 text-foreground/60">{sr.totalAttempts}</td>
                         <td className="py-2 px-3">
-                          {needsHelp ? (
+                          {hideResults ? (
+                            sr.total >= questions.length ? (
+                              <span className="text-xs px-2 py-0.5 rounded-full bg-purple-400/20 text-purple-300">Dokončil/a</span>
+                            ) : (
+                              <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-400/20 text-yellow-300">Probíhá ({sr.total}/{questions.length})</span>
+                            )
+                          ) : needsHelp ? (
                             <span className="text-xs px-2 py-0.5 rounded-full bg-red-400/20 text-red-400">Potřebuje podporu</span>
                           ) : sr.total >= currentQuestion ? (
                             <span className="text-xs px-2 py-0.5 rounded-full bg-green-400/20 text-green-400">Odpověděl/a</span>

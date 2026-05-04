@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabase";
 import { generateCode, randomAvatarColor } from "@/lib/utils";
@@ -418,7 +418,7 @@ function StarsTab({ classes }: { classes: Class[] }) {
   );
 }
 
-export default function DashboardPage() {
+function DashboardInner() {
   const [authorized, setAuthorized] = useState(false);
   const [classes, setClasses] = useState<Class[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -428,7 +428,12 @@ export default function DashboardPage() {
   const [studentCount, setStudentCount] = useState(25);
   const [creating, setCreating] = useState(false);
   const [generatedStudents, setGeneratedStudents] = useState<Student[] | null>(null);
-  const [tab, setTab] = useState<"classes" | "activities" | "stars" | "competences">("classes");
+  const searchParams = useSearchParams();
+  const initialTab = (() => {
+    const t = searchParams.get("tab");
+    return t === "activities" || t === "stars" || t === "competences" || t === "classes" ? t : "classes";
+  })();
+  const [tab, setTab] = useState<"classes" | "activities" | "stars" | "competences">(initialTab);
   // Quick-launch state
   const [launchActivityId, setLaunchActivityId] = useState<string | null>(null);
   const [launchClassId, setLaunchClassId] = useState("");
@@ -540,7 +545,7 @@ export default function DashboardPage() {
     setLaunching(false);
     // Grouped activities go straight to lobby in prezentace; others to results overview
     const dest = act?.requires_grouping ? `prezentace` : `vysledky`;
-    router.push(`/ucitel/lekce/${data.id}/${dest}`);
+    router.push(`/ucitel/session/${data.id}/${dest}`);
   }
 
   function exportCSV() {
@@ -577,6 +582,12 @@ export default function DashboardPage() {
             Cesta inovátora
           </Link>
           <div className="flex items-center gap-4">
+            <Link href="/ucitel/lekce" className="text-sm text-foreground/70 hover:text-accent transition-colors">
+              📚 Lekce
+            </Link>
+            <Link href="/ucitel/aktivity" className="text-sm text-foreground/70 hover:text-accent transition-colors">
+              🧩 Aktivity
+            </Link>
             <Link href="/ucitel/prezentace" target="_blank" className="text-sm font-bold text-cyan-400 hover:text-cyan-300 transition-colors">
               📺 Projektor →
             </Link>
@@ -601,7 +612,7 @@ export default function DashboardPage() {
             onClick={() => setTab("activities")}
             className={`pb-3 text-lg font-semibold transition-colors border-b-2 ${tab === "activities" ? "text-accent border-accent" : "text-foreground/40 border-transparent hover:text-foreground/60"}`}
           >
-            Knihovna lekcí
+            Knihovna aktivit
           </button>
           <button
             onClick={() => setTab("stars")}
@@ -742,10 +753,10 @@ export default function DashboardPage() {
                           Kódy žáků
                         </Link>
                         <Link
-                          href={`/ucitel/lekce/nova?class=${cls.id}`}
+                          href={`/ucitel/session/nova?class=${cls.id}`}
                           className="px-3 py-1.5 text-xs bg-accent/20 text-accent rounded-lg hover:bg-accent/30 transition-colors font-medium"
                         >
-                          + Lekce
+                          + Spustit
                         </Link>
                       </div>
                     </div>
@@ -760,7 +771,7 @@ export default function DashboardPage() {
                             return (
                               <Link
                                 key={s.id}
-                                href={`/ucitel/lekce/${s.id}/vysledky`}
+                                href={`/ucitel/session/${s.id}/vysledky`}
                                 className="flex items-center justify-between py-2 px-3 rounded-lg hover:bg-primary/10 transition-colors group"
                               >
                                 <div className="flex items-center gap-3">
@@ -802,7 +813,7 @@ export default function DashboardPage() {
         {tab === "activities" && (
           <>
             <div className="flex items-center justify-between mb-6">
-              <h1 className="text-2xl font-bold text-white">Knihovna lekcí</h1>
+              <h1 className="text-2xl font-bold text-white">Knihovna aktivit</h1>
             </div>
 
             {activities.length === 0 ? (
@@ -938,5 +949,17 @@ export default function DashboardPage() {
         )}
       </div>
     </main>
+  );
+}
+
+export default function DashboardPage() {
+  return (
+    <Suspense fallback={
+      <main className="min-h-screen flex items-center justify-center bg-background">
+        <p className="text-foreground/60">Načítání...</p>
+      </main>
+    }>
+      <DashboardInner />
+    </Suspense>
   );
 }

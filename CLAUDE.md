@@ -125,26 +125,40 @@ VŠE je event log. Sbíráme chování, ne jen odpovědi.
 
 ---
 
-## Scoring systém - dva režimy
+## Scoring systém — DUAL-SKILL filozofie
 
-### LEARNING mód (procvičování) 🎓 - PRÁCE S CHYBOU je core koncept
-- Správně napoprvé rychle (≤10s) = 85 XP + "Skvělé! Jistá odpověď"
-- Správně napoprvé pomalu (>10s) = 90 XP + "Hluboké přemýšlení se vyplatí"
-- Chyba → oprava → správně = 100 XP + growth mindset zpráva (NEJVÍC XP!)
-- Chyba bez opravy = 20 XP + "Příště to zkus, mozek potřebuje výzvy"
-- Skip = 0 XP, zobrazí "Přeskočeno, vrátíme se k tomu"
-- Timeout = 0 XP, zobrazí "Čas vypršel!"
+XP body jsou **vždy stejné** — rozdíl mezi „správně napoprvé" a „chyba → oprava" se NEprojevuje v bodech, ale ve **dvou nezávislých skill counterech**:
 
-### ASSESSMENT mód (ověření znalostí) 📊
-- Jeden pokus, žádné nápovědy, žádná oprava
-- Správně = 100 XP
-- Špatně = 0 XP + "Uloženo pro příště - vrátíme se k tomu"
-- Výsledky se ukáží až po skončení celého kvízu
+| Outcome                     | XP   | Skill counter             | Zpráva žákovi                              |
+|-----------------------------|------|---------------------------|--------------------------------------------|
+| Správně napoprvé            | 100  | `skill_presnost +1`       | „💎 Přesná odpověď! Skill Přesnost +1"     |
+| Chyba → oprava → správně    | 100  | `skill_prace_s_chybou +1` | „🔄 Skvělá oprava! Skill Práce s chybou +1" |
+| Špatně bez opravy           | 30   | (žádný)                   | „Příště to zkus znovu 💪"                  |
+| Skip                        | 0    | (žádný)                   | „Přeskočeno, vrátíme se k tomu"            |
+| Timeout                     | 0    | (žádný)                   | „Čas vypršel!"                             |
 
-### Nastavení režimu (sessions.activity_mode):
-- "learning" = všechny otázky procvičování
-- "assessment" = všechny otázky ověření
-- "mixed" = každá otázka má vlastní assessment_mode v JSONB
+Konstanty v `src/types/index.ts`: `XP_CORRECT_FIRST_TRY`, `XP_CORRECTED`, `XP_WRONG`. Helper `classifyOutcome()` + `computeSkillCounters()` (agregát z `student_events`).
+
+**Mapování skill → kompetence** (v `SKILL_TO_COMPETENCE`):
+- `presnost` → `rvp_reseni_problemu`
+- `prace_s_chybou` → `entrecomp_learning_through_experience`
+
+Oba skilly jsou **pozitivní indikátory různých kompetencí**. V učitelském dashboardu se zobrazují vedle sebe: `[💎 Přesnost: 12] [🔄 Práce s chybou: 8]`.
+
+### Režim kvízu (`sessions.activity_mode`)
+Toggle při spouštění session: **🎓 Procvičování** (learning) vs **📊 Test** (assessment). Mixed režim je k dispozici jen pro single-activity session.
+
+#### LEARNING (procvičování)
+- Sokratovské hinty zachovány, okamžitá zpětná vazba
+- Po odpovědi: skill zpráva + XP popup + per-question vysvětlení
+- Učitelský dashboard: live výsledky (Kahoot bary, per-žák správnost, dual-skill countery)
+
+#### ASSESSMENT (test)
+- **Žádné** hinty, **žádné** opravy během testu
+- Po odpovědi: jen „Odpověď uložena ✓" — bez hodnocení, bez XP popup, bez vysvětlení
+- Žák **nevidí** XP počítadlo během testu
+- **Učitel vidí jen completion count** („12/25 dokončilo"), žádnou správnost, žádný leaderboard
+- Po dokončení (auto / manuálně) → výsledky se zpřístupní (správnost otázek, dual-skill countery, XP)
 
 ---
 
@@ -312,6 +326,104 @@ Kvízy = automaticky. Citlivá hodnocení = vždy přes učitele.
 - Mobile-first (žáci na mobilu)
 - Gamifikace: XP animace, progress bar, okamžitá zpětná vazba, leaderboard
 
+## Dvouúrovňová struktura: Lekce → Aktivity
+
+Od migrace v12 jsou **lekce** a **aktivity** dvě oddělené entity propojené přes junction tabulku.
+
+### Datový model
+- **`lessons`** — kontejner: `title`, `description`, `lesson_number`, `phase`, `learning_goal`, `total_duration_min`, `is_published`, `created_by`
+- **`activities`** — atomická jednotka: `title`, `type` (`quiz`/`open`/`peer_review`/`photo_upload`/`group_work`/`team_forge`/`pitch_duel`/...), `default_duration_min`, `assessment_mode`, `competence_weights`, `instructions`, `config` JSONB (typ-specifická konfigurace), `is_public`. Quiz drží otázky v `questions` JSONB; ostatní typy konfiguraci v `config`.
+- **`lesson_activities`** — junction: `lesson_id`, `activity_id`, `order_index` (1..N), `is_optional`, `custom_duration_min`, `teacher_note`. Unikátní `(lesson_id, order_index)`.
+- **`sessions`** — rozšířeno o: `lesson_id` (NULL = single-activity flow), `current_activity_index`, `completed_activity_ids` (JSONB array). `activity_id` zůstává (pro zpětnou kompat ukazuje na první aktivitu lekce).
+
+### Routing (učitel)
+- `/ucitel/lekce` — knihovna lekcí (list)
+- `/ucitel/lekce/[id]` — editor lekce s drag & drop pořadí (`@dnd-kit/sortable`) + šipky ↑↓ jako mobilní fallback
+- `/ucitel/lekce/nova` — vytvoří prázdnou lekci a přesměruje do editoru
+- `/ucitel/aktivity` — knihovna aktivit s filtry (typ, délka, fulltext)
+- `/ucitel/aktivita/[id]` — detail/editor jedné aktivity
+- `/ucitel/session/[id]` — běžící session (QR kód)
+- `/ucitel/session/[id]/vysledky` — živé výsledky session
+- `/ucitel/session/[id]/prezentace` — projektor view
+- `/ucitel/session/nova` — spuštění session (toggle: lekce / aktivita)
+
+### Žákovský flow `/lekce/[code]` (lockstep s učitelem)
+Lekce běží **postupně pod vedením učitele** — žádný self-paced režim. Server-side stav je zdrojem pravdy:
+
+- `sessions.lesson_id` ≠ NULL → flow řízený `current_activity_index` + `current_question`
+  - Žák čte session přes polling (3 s interval) a sleduje **`current_activity_index`**: změna indexu → reset všech klientských stavů, překlopení na novou aktivitu.
+  - **Quiz aktivita uvnitř lekce** = klasický Kahoot (učitel řídí `current_question`).
+  - **Non-quiz aktivita** (open / peer_review / photo_upload / group_work) = žák vyplní formulář, odešle, pak vidí „Aktivita dokončena, čeká, až učitel spustí další aktivitu".
+- `sessions.lesson_id` = NULL → původní single-activity flow (klasický kvíz, team_forge, pitch_duel, legacy multi_activity).
+
+### Spuštění lekce z editoru
+V `/ucitel/lekce/[id]` (editor lekce) je tlačítko **„▶ Spustit pro třídu"** → vede na `/ucitel/session/nova?lesson=<id>` s předvyplněnou lekcí. Učitel tedy může lekci upravit a hned ji spustit.
+
+### Per-session přeskočení aktivit (skipped_activity_ids)
+V launch screenu `/ucitel/session/nova` se po vybrání lekce zobrazí **checklist všech aktivit** s krátkým popisem. Učitel může odškrtnout aktivity, které pro tuto session vyhodit (např. méně času → vypustit kvíz nebo focení). Šablona lekce zůstane beze změny — skip se ukládá do `sessions.skipped_activity_ids` JSONB array (lesson_activity ID).
+
+LessonRunner (žák) i `handleNextLessonActivity` (učitel) přeskakují tyto ID při iteraci. Progress bar zobrazuje jen non-skipped aktivity.
+
+### Závislosti aktivit (requires_lesson_activity_ids)
+`lesson_activities.requires_lesson_activity_ids` (JSONB array) deklaruje, které **jiné** lesson_activities z stejné lekce tato aktivita vyžaduje. Když učitel v launch checklistu odškrtne X, **cascade auto-odškrtne** všechny aktivity Y, které X vyžadují (tranzitivně). Žlutý label „Auto-vypnuto (vyžaduje předchozí aktivitu)" vysvětluje proč.
+
+L5 dependency graph: Hlasování → Brainstorm; Sestavení → Hlasování + Volba role; Strom → Sestavení. Standalone: Kvíz, Brainstorm, Volba role.
+
+### Učitelské ovládání lekce — `/ucitel/session/[id]/vysledky`
+- Nahoře je **postup lekcí** (progress dots přes všechny aktivity).
+- Pro **quiz aktivitu** v lekci: standardní Kahoot ovládání + tlačítko **„Spustit další aktivitu →"** místo „Dokončit kvíz" (na poslední otázce). Na poslední otázce poslední aktivity: **„Dokončit lekci"** (zavře session).
+- Pro **non-quiz aktivitu**: zjednodušený panel (počet připojených, počet odevzdání) + tlačítko **„Spustit další aktivitu →"** / **„Dokončit lekci"**.
+- `handleNextLessonActivity()` inkrementuje `current_activity_index`, resetuje `current_question=0` a `answering_open=true`, synchronizuje legacy `activity_id`. Po poslední aktivitě → `status='closed'`.
+
+### Adaptéry
+`src/lib/lesson-adapters.ts` mapuje `Activity` (nový dvouúrovňový tvar) → `SubActivity` (legacy tvar) pro reuse step komponent (`BrainstormStep`, `VotingStep`, `PhotoStep`). Helper `isQuizLikeActivity(type)` rozlišuje quiz typy (`quiz`, `ab_decision`, `ab_with_explanation`, `scale`) od non-quiz (`open`, `peer_review`, `photo_upload`, `group_work`).
+
+### Hledání příležitostí (dvouúrovňová verze, 5. lekce programu)
+Lesson `a5e50001-…-005`, lesson_number=5, fáze 1, ~115 min. **6 atomických aktivit:**
+1. **Kvíz: Inovátor vs. Stěžovatel** (`quiz`, 15 min, 10 AB otázek, learning) — rétorika „Vidím, že..." vs „Štve mě..."
+2. **Brainstorm: Moje příležitost** (`open`, 20 min, **1 textové pole, min 20 slov**, AI feedback, learner review)
+3. **Představení příležitostí a hlasování** (`peer_review`, **15 min, requires_grouping=true, team_size=4**) — group flow:
+   - **Lobby** (učitel rozdělí třídu)
+   - **Sekvenční prezentace**: random pořadí presenterů. Žák během celé prezentační fáze vidí **jen svůj vlastní nápad** (ostatní jsou skryté ať se soustředí na poslouchání mluvčího). Když je řada na něm, zobrazí se mu „Pozor, ty budeš prezentovat" gate s tlačítkem **„Jdu na to ▶"**. Po kliku se spustí countdown (default `per_speaker_ms = 60000`). Ostatní mezi tím vidí „[Anna] se připravuje…", po kliku jen „Anna prezentuje" + sdílený timer + „Poslouchej, co mluvčí říká…" (text nápadu vidí jen sám presenter). Presenter má pod kartou tlačítko **„✓ Hotovo, posunout dál"** pro skip dřív než vyprší limit. Po doběhnutí timeru se auto-advancuje (idempotent přes `session_groups.state`, last write wins).
+   - **Hlasování** (až po dokončení všech prezentací): anonymně, max 2 hlasy, ne pro vlastní nápad. Vítěz = „týmová příležitost"
+4. **Volba role v týmu** (`role_selection`, 5 min) — žák si vybere 1 z 5 týmových rolí (🎨 Designér / ⚙️ Technik / 📢 Komunikátor / 💡 Inovátor / 📋 Manažer); uloží do `students.team_role`; po odeslání vidí rozložení rolí třídy
+5. **Sestavení týmů** (`team_assembly`, 15 min) — 4-fázový flow:
+   - **A)** Server označí lídry = vlastníky vítězných příležitostí z hlasování (jeden lídr per session_group)
+   - **B)** Ostatní žáci vidí seznam příležitostí a vyberou si tým
+   - **C)** Lídr vidí složení s rolemi + indikátor diverzity (≥3 různé role = ideální), klikne „Potvrdit tým"
+   - **D)** Učitel v `/ucitel/session/[id]/vysledky` schvaluje každý tým, může přesouvat žáky mezi týmy. Tlačítko „Spustit další aktivitu" je odemčené teprve když jsou schválené všechny týmy.
+6. **Strom příležitosti** (`photo_upload`, 45 min, AI verifikace 4 částí stromu)
+
+Kompetence (lekce): EntreComp Spotting Opportunities (0.9), Creativity (0.7), Vision (0.6), Working with Others (0.6), Self Awareness (0.5) + RVP K podnikavosti (0.8).
+
+Seedy:
+- **`seed-L5-aktivity.sql`** (canonical, 6 aktivit) — vyžaduje `migration-v12-lessons-activities.sql` + `migration-v13-teams.sql`
+- `seed-L5-dvouurovnova.sql` superseded (4 aktivity, ponecháno pro historii)
+
+### Týmové role (taxonomie)
+Žák volí v aktivitě `role_selection`, ukládá se do `students.team_role` (VARCHAR(20)). Konstanty v `src/types/index.ts`:
+
+| Role           | Emoji | Tagline                                       |
+|----------------|-------|-----------------------------------------------|
+| `designer`     | 🎨    | „Mám rád vizuál a kreativitu"                  |
+| `engineer`     | ⚙️    | „Mám rád analýzu a realizaci"                  |
+| `communicator` | 📢    | „Mám rád prezentování a diplomacii"            |
+| `innovator`    | 💡    | „Mám rád nápady a vize"                        |
+| `manager`      | 📋    | „Mám rád organizaci a plánování"               |
+
+Helper: `TEAM_ROLE_INFO[role]` (label/emoji/tagline/description), `ALL_TEAM_ROLES`. Předchozí behaviorální taxonomie (leader/analyst/creative/mediator/executor) byla nahrazena — `detectTeamRole()` je no-op stub.
+
+### Tabulka `teams` (migration v13)
+Sestavený tým z `team_assembly`:
+- `id`, `session_id`, `lesson_id`, `activity_id`
+- `opportunity_text` (vítězná příležitost), `source_event_id`
+- `leader_student_id` (FK na students), `member_ids` JSONB (array studentových id včetně lídra)
+- `roles_summary` JSONB ({ "designer": 2, ... })
+- `is_leader_confirmed`, `is_approved`, `approved_by`, `approved_at`
+- Unique constraint `(session_id, leader_student_id)` — jeden tým per lídr na session
+
+Liší se od `session_groups` (generický grouping pro voting/team_forge/pitch_duel) — `teams` je výsledek role-aware self-organizace.
+
 ## Tech stack
 - Next.js 14 + TypeScript + Tailwind CSS
 - Supabase (databáze PostgreSQL + auth + storage)
@@ -336,3 +448,9 @@ Kvízy = automaticky. Citlivá hodnocení = vždy přes učitele.
 - Nástroj pro tvorbu otázek (/ucitel/otazky/nova) ✅
 - Peer reviews tabulka (prepared) ✅
 - SWOT profil žáka + team role detection ✅
+- Lekce L5 — Hledání příležitosti (multi_activity seed, legacy) ✅
+- Dvouúrovňová struktura Lekce → Aktivity (migration v12) ✅
+- Knihovna lekcí + editor s drag & drop (@dnd-kit) ✅
+- Knihovna aktivit s filtry ✅
+- Dual-mode žákovský flow (lesson_id vs single-activity) ✅
+- L5 přepsaná do dvouúrovňové struktury (seed-L5-dvouurovnova.sql) ✅

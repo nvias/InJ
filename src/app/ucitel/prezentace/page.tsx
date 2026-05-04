@@ -164,7 +164,7 @@ export default function ProjectorPage() {
       <h1 className="text-5xl font-black tracking-wider mb-4">{activity.title}</h1>
       <p className="text-white/50 mb-8">Tento typ aktivity zatím nemá projektor view</p>
       <Link
-        href={`/ucitel/lekce/${activeSession.id}/prezentace`}
+        href={`/ucitel/session/${activeSession.id}/prezentace`}
         className="px-6 py-3 bg-cyan-400 text-black font-bold rounded-lg tracking-wider hover:shadow-[0_0_20px_#00D4FF]"
       >
         Otevřít plnou prezentaci →

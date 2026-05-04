@@ -226,15 +226,15 @@ export default function ProfilPage() {
     }
     setEntreCompMap(ecMap);
 
-    // Team role detection (simplified)
-    if (events && events.length > 5) {
-      const avgTime = events.reduce((s, e) => s + e.duration_ms, 0) / events.length;
-      const corrRate = totalAnswers > 0 ? totalCorrections / totalAnswers : 0;
-      const fastAnswers = events.filter((e) => e.duration_ms < 8000).length / events.length;
-      if (fastAnswers > 0.6) setTeamRole("leader");
-      else if (corrRate > 0.3) setTeamRole("analyst");
-      else if (avgTime > 15000) setTeamRole("mediator");
-      else setTeamRole("executor");
+    // Týmová role: čte se ze students.team_role (nastavuje aktivita role_selection v lekci).
+    // Behaviorální detekce z eventů byla odstraněna při přechodu na preferenční taxonomii.
+    const { data: studentRow } = await supabase
+      .from("students")
+      .select("team_role")
+      .eq("id", auth.studentId)
+      .single();
+    if (studentRow?.team_role) {
+      setTeamRole(studentRow.team_role as TeamRole);
     }
   }, [auth]);
 

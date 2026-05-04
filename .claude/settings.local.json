@@ -31,7 +31,14 @@
       "Bash(npx tsc:*)",
       "Bash(wc:*)",
       "Bash(grep -n \"avatar_emoji\\\\|display_name\\\\|swot_profile\" C:/Users/pavel/InJ/supabase-schema.sql C:/Users/pavel/InJ/migration-v*.sql)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(cat \"C:\\\\\\\\Users\\\\\\\\pavel\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\C--Users-pavel-InJ\\\\\\\\be5c4545-a573-4c7d-b325-8c6f8cf3d6e9\\\\\\\\tasks\\\\\\\\bus3kv7cs.output\")",
+      "Bash(git diff *)",
+      "Bash(git mv *)",
+      "PowerShell(New-Item *)",
+      "PowerShell(Remove-Item *)",
+      "Bash(git add *)"
     ]
   }
 }

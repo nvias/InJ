@@ -3,15 +3,23 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import type { Question, Activity, Session, ActivityMode, AssessmentMode, QuestionType } from "@/types";
+import type { Question, Activity, Session, ActivityMode } from "@/types";
 import ABDecision from "@/components/ABDecision";
 import TeamForge from "@/components/TeamForge";
 import LobbyWaitingScreen from "@/components/LobbyWaitingScreen";
 import PitchDuel from "@/components/PitchDuel";
+import MultiActivity from "@/components/multi-activity/MultiActivity";
+import BrainstormStep from "@/components/multi-activity/BrainstormStep";
+import VotingStep from "@/components/multi-activity/VotingStep";
+import PhotoStep from "@/components/multi-activity/PhotoStep";
+import RoleSelectionStep from "@/components/multi-activity/RoleSelectionStep";
+import TeamAssemblyStep from "@/components/multi-activity/TeamAssemblyStep";
+import { toOpenSub, toPeerReviewSub, toGroupWorkSub, isQuizLikeActivity } from "@/lib/lesson-adapters";
 import {
-  calcXp, getQuestionMode, pickMessage,
-  GROWTH_CORRECT_MSGS, GROWTH_CORRECTED_MSGS, GROWTH_WRONG_MSGS,
-  GROWTH_SKIP_MSG, GROWTH_TIMEOUT_MSG, GROWTH_ASSESSMENT_MSG,
+  calcXp, getQuestionMode,
+  GROWTH_CORRECTED_MSGS,
+  GROWTH_TIMEOUT_MSG, GROWTH_ASSESSMENT_MSG,
+  SKILL_MSG_PRESNOST, SKILL_MSG_PRACE_S_CHYBOU, SKILL_MSG_WRONG,
 } from "@/types";
 
 interface StudentAuth {
@@ -27,6 +35,17 @@ export default function LekcePage({ params }: { params: { code: string } }) {
   const [auth, setAuth] = useState<StudentAuth | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [activity, setActivity] = useState<Activity | null>(null);
+  // Lesson-mode state (when session.lesson_id is set). Lesson běží lockstep s učitelem:
+  // server `current_activity_index` je zdroj pravdy, polling detekuje změnu a překlopí UI.
+  const [lessonTitle, setLessonTitle] = useState<string>("");
+  const [lessonActivities, setLessonActivities] = useState<Activity[]>([]);
+  const [lessonActivityIds, setLessonActivityIds] = useState<string[]>([]);   // la_id per index
+  const [skippedLaIds, setSkippedLaIds] = useState<Set<string>>(new Set());   // skipped lesson_activity ids
+  const [currentActivityIdx, setCurrentActivityIdx] = useState(0);
+  const currentActivityIdxRef = useRef(0);
+  const [activityCompleted, setActivityCompleted] = useState(false);
+  const lessonActivitiesRef = useRef<Activity[]>([]);
+  const lessonActivityIdsRef = useRef<string[]>([]);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [teacherQ, setTeacherQ] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
@@ -75,13 +94,9 @@ export default function LekcePage({ params }: { params: { code: string } }) {
       sessionIdRef.current = sess.id;
       setActivityMode((sess.activity_mode as ActivityMode) || "learning");
       setTimerSeconds(sess.timer_seconds ?? null);
-      const act = sess.activities as unknown as Activity;
-      setActivity(act);
-      setQuestions(act.questions);
-      setTeacherQ(sess.current_question ?? 0);
+      let act = sess.activities as unknown as Activity;
 
-      // Record join event so teacher sees this student
-      // Check if already joined to avoid duplicates
+      // Record join event so teacher sees this student (avoid duplicates)
       const { data: existing } = await supabase
         .from("student_events")
         .select("id")
@@ -103,18 +118,81 @@ export default function LekcePage({ params }: { params: { code: string } }) {
         });
       }
 
-      // Load already answered questions
-      const { data: events } = await supabase
+      // LESSON MODE — načti lesson_activities a překlop `act` na current activity.
+      // Dál pokračuje normální init (kvíz se chová jako single-activity Kahoot).
+      if (sess.lesson_id) {
+        const [{ data: lRow }, { data: laRows }] = await Promise.all([
+          supabase.from("lessons").select("title").eq("id", sess.lesson_id).single(),
+          supabase
+            .from("lesson_activities")
+            .select("id, activity:activities(*)")
+            .eq("lesson_id", sess.lesson_id)
+            .order("order_index", { ascending: true }),
+        ]);
+        setLessonTitle(lRow?.title ?? act.title);
+        const rows = (laRows ?? []) as unknown as Array<{ id: string; activity: Activity }>;
+        const acts = rows.map((r) => r.activity).filter(Boolean);
+        const ids = rows.map((r) => r.id);
+        setLessonActivities(acts);
+        setLessonActivityIds(ids);
+        lessonActivitiesRef.current = acts;
+        lessonActivityIdsRef.current = ids;
+        // Skipped activities pro tuto session (per-session override)
+        const skippedArr = Array.isArray(sess.skipped_activity_ids) ? sess.skipped_activity_ids as string[] : [];
+        setSkippedLaIds(new Set(skippedArr));
+        const idx = sess.current_activity_index ?? 0;
+        setCurrentActivityIdx(idx);
+        currentActivityIdxRef.current = idx;
+        if (acts[idx]) act = acts[idx];
+      }
+
+      setActivity(act);
+      setQuestions(act.questions ?? []);
+      setTeacherQ(sess.current_question ?? 0);
+
+      // Legacy multi-activity (sub_activities JSONB) — vlastní self-paced runner
+      if (act.type === "multi_activity") {
+        setLoading(false);
+        return;
+      }
+
+      // Non-quiz aktivita v rámci lekce — žádné Kahoot otázky, render step.
+      if (sess.lesson_id && !isQuizLikeActivity(act.type)) {
+        // Detekce zda už student v této session aktivitu odevzdal
+        const { data: completionEvents } = await supabase
+          .from("student_events")
+          .select("event_type")
+          .eq("student_id", parsed.studentId)
+          .eq("session_id", sess.id)
+          .eq("question_id", act.id)
+          .in("event_type", ["text_submit", "photo_upload", "peer_rating", "activity_complete"])
+          .limit(1);
+        setActivityCompleted((completionEvents?.length ?? 0) > 0);
+        setLoading(false);
+        return;
+      }
+
+      // Quiz-like aktivita: standardní Kahoot init.
+      // Načti už zodpovězené otázky (filtrované podle current activity ID — pro lekce).
+      let answeredQ = supabase
         .from("student_events")
         .select("question_id")
         .eq("student_id", parsed.studentId)
         .eq("session_id", sess.id)
-        .neq("event_type", "join");
+        .eq("event_type", "answer");
+      if (sess.lesson_id) {
+        // Otázky z předchozích aktivit ignoruj — patří jiné aktivitě.
+        const currentQuestionIds = (act.questions ?? []).map((q: Question) => q.id);
+        if (currentQuestionIds.length > 0) {
+          answeredQ = answeredQ.in("question_id", currentQuestionIds);
+        }
+      }
+      const { data: events } = await answeredQ;
 
       const answered = new Set<number>();
       if (events) {
         for (const e of events) {
-          const idx = act.questions.findIndex((q: Question) => q.id === e.question_id);
+          const idx = (act.questions ?? []).findIndex((q: Question) => q.id === e.question_id);
           if (idx >= 0) answered.add(idx);
         }
       }
@@ -175,22 +253,22 @@ export default function LekcePage({ params }: { params: { code: string } }) {
     setTimeout(() => setPhase("waiting-next"), 2000);
   }
 
-  // Poll teacher's current_question every 3 seconds
+  // Poll teacher's session state every 3 seconds.
+  // V lesson módu sleduje navíc `current_activity_index` — když se změní, překlopí UI na novou aktivitu.
   const pollSession = useCallback(async () => {
     if (!sessionIdRef.current) return;
     const { data } = await supabase
       .from("sessions")
-      .select("current_question, is_active, answering_open, status, teacher_heartbeat")
+      .select("current_question, current_activity_index, lesson_id, is_active, answering_open, status, teacher_heartbeat, skipped_activity_ids")
       .eq("id", sessionIdRef.current)
       .single();
 
     if (!data) return;
 
-    // Check teacher heartbeat - if > 15s old, teacher disconnected
+    // Heartbeat — pokud učitel "umřel" (>15 s bez heartbeat), pošli žáka na profil
     if (data.teacher_heartbeat) {
       const hbAge = Date.now() - new Date(data.teacher_heartbeat).getTime();
       if (hbAge > 15000 && data.is_active) {
-        // Teacher disconnected but session not yet paused
         router.replace("/zak/profil");
         return;
       }
@@ -206,12 +284,66 @@ export default function LekcePage({ params }: { params: { code: string } }) {
       return;
     }
 
+    // Synchronizuj session.status do local state (kvůli lobby fázi mid-lesson)
+    setSession((prev) => prev && prev.status !== data.status ? { ...prev, status: data.status } : prev);
+
+    // LESSON MODE — detekuj změnu current_activity_index, překlop na novou aktivitu.
+    // Při každé změně načti FRESH lesson_activities z DB (učitel mohl mezitím editovat
+    // aktivity nebo update typ — držet stale cache by způsobilo "není podporována" fallback).
+    const newActIdx = data.current_activity_index ?? 0;
+    if (data.lesson_id) {
+      const prevIdx = currentActivityIdxRef.current;
+      // Refresh skipped IDs (učitel mohl mezitím upravit; dohrát i pro stávající session)
+      const skippedArr = Array.isArray(data.skipped_activity_ids) ? data.skipped_activity_ids as string[] : [];
+      setSkippedLaIds(new Set(skippedArr));
+      if (newActIdx !== prevIdx) {
+        const { data: laRows } = await supabase
+          .from("lesson_activities")
+          .select("id, activity:activities(*)")
+          .eq("lesson_id", data.lesson_id)
+          .order("order_index", { ascending: true });
+        const rows = (laRows ?? []) as unknown as Array<{ id: string; activity: Activity }>;
+        const freshActs = rows.map((r) => r.activity).filter(Boolean);
+        const freshIds = rows.map((r) => r.id);
+        if (freshActs.length > 0) {
+          setLessonActivities(freshActs);
+          setLessonActivityIds(freshIds);
+          lessonActivitiesRef.current = freshActs;
+          lessonActivityIdsRef.current = freshIds;
+        }
+        const newAct = (freshActs[newActIdx] ?? lessonActivitiesRef.current[newActIdx]);
+        if (newAct) {
+          setActivity(newAct);
+          setQuestions(newAct.questions ?? []);
+          setSelected(null);
+          setAttempt(1);
+          setActivityCompleted(false);
+          answeredRef.current = new Set();
+          setTeacherQ(0);
+          if (isQuizLikeActivity(newAct.type)) {
+            setPhase((data.answering_open ?? true) ? "answering" : "waiting-next");
+            startTimeRef.current = Date.now();
+          } else {
+            setPhase("answering"); // step component se vyrenderuje
+          }
+          setCurrentActivityIdx(newActIdx);
+          currentActivityIdxRef.current = newActIdx;
+        }
+      }
+      // V non-quiz lesson aktivitě dál nesleduj current_question
+      const acts = lessonActivitiesRef.current;
+      const curAct = acts[newActIdx];
+      if (curAct && !isQuizLikeActivity(curAct.type)) return;
+    }
+
     const newQ = data.current_question ?? 0;
     const open = data.answering_open ?? true;
 
     setTeacherQ((prevQ) => {
       if (newQ !== prevQ) {
         if (newQ >= questions.length) {
+          // V lesson módu to znamená "kvíz dokončen, čeká se na učitele další aktivitu"
+          // — ale finished phase je vyloženě konec celé session, takže to vyřešíme renderingem.
           setPhase("finished");
         } else if (!answeredRef.current.has(newQ)) {
           setSelected(null);
@@ -222,18 +354,18 @@ export default function LekcePage({ params }: { params: { code: string } }) {
           setPhase("waiting-next");
         }
       } else if (!open && !answeredRef.current.has(newQ)) {
-        // Teacher closed answering while student hasn't answered yet
         setPhase("waiting-next");
       }
       return newQ;
     });
-  }, [questions.length]);
+  }, [questions.length, router]);
 
   useEffect(() => {
     if (loading) return;
+    if (activity?.type === "multi_activity" && !session?.lesson_id) return;   // legacy self-paced bez lesson_id
     const interval = setInterval(pollSession, 3000);
     return () => clearInterval(interval);
-  }, [loading, pollSession]);
+  }, [loading, pollSession, activity?.type, session?.lesson_id]);
 
   const saveEvent = useCallback(
     async (answer: string | null, isCorrect: boolean, attemptNo: number, durationMs: number) => {
@@ -285,17 +417,17 @@ export default function LekcePage({ params }: { params: { code: string } }) {
     const mode = getQuestionMode(activityMode, q);
 
     if (mode === "assessment") {
-      // Assessment: jeden pokus, bez hintu
+      // Assessment: jeden pokus, bez hintu, BEZ feedback (žádné XP popup, žádný správně/špatně)
+      // XP a skill countery se počítají na pozadí — žák je uvidí až po dokončení testu.
       const xp = calcXp("assessment", isCorrect, 1, durationMs);
       setXpGained(xp);
       setTotalXp((prev) => prev + xp);
-      if (xp > 0) { setShowXp(true); setTimeout(() => setShowXp(false), 1200); }
       saveEvent(key, isCorrect, 1, durationMs);
       answeredRef.current = new Set(answeredRef.current).add(teacherQ);
       setLastResult(isCorrect ? "correct" : "wrong");
       setQuestionNumber((n) => n + 1);
       setPhase("result");
-      setTimeout(() => setPhase("waiting-next"), 2000);
+      setTimeout(() => setPhase("waiting-next"), 1500);
     } else {
       // Learning: více pokusů, hint, socratic feedback
       if (isCorrect) {
@@ -413,15 +545,136 @@ export default function LekcePage({ params }: { params: { code: string } }) {
     );
   }
 
+  // LESSON MODE — non-quiz aktivita: render step komponentu nebo "Hotovo, čekej" screen
+  if (session?.lesson_id && activity && auth && !isQuizLikeActivity(activity.type)) {
+    const order = currentActivityIdx + 1;
+
+    if (activityCompleted) {
+      return (
+        <LessonShell
+          lessonTitle={lessonTitle}
+          activities={lessonActivities}
+          activityIds={lessonActivityIds}
+          skipped={skippedLaIds}
+          currentIdx={currentActivityIdx}
+          studentEmoji={auth.avatarEmoji}
+          totalXp={totalXp}
+        >
+          <ActivityWaitingScreen activityTitle={activity.title} />
+        </LessonShell>
+      );
+    }
+
+    const onComplete = (xpGained: number) => {
+      setTotalXp((p) => p + xpGained);
+      setActivityCompleted(true);
+    };
+
+    let stepEl: React.ReactNode = null;
+    if (activity.type === "open") {
+      const sub = toOpenSub(activity, order);
+      stepEl = <BrainstormStep subActivity={sub} studentId={auth.studentId} sessionId={session.id} onComplete={onComplete} />;
+    } else if (activity.type === "peer_review") {
+      const sub = toPeerReviewSub(activity, order);
+      stepEl = <VotingStep subActivity={sub} studentId={auth.studentId} sessionId={session.id} onComplete={onComplete} />;
+    } else if (activity.type === "photo_upload" || activity.type === "group_work") {
+      const sub = toGroupWorkSub(activity, order);
+      if (sub) {
+        stepEl = <PhotoStep subActivity={sub} studentId={auth.studentId} sessionId={session.id} onComplete={onComplete} />;
+      }
+    } else if (activity.type === "role_selection") {
+      stepEl = (
+        <RoleSelectionStep
+          activityId={activity.id}
+          studentId={auth.studentId}
+          sessionId={session.id}
+          classId={auth.classId}
+          xp={(activity.config?.xp_complete as number | undefined) ?? 50}
+          onComplete={onComplete}
+        />
+      );
+    } else if (activity.type === "team_assembly") {
+      stepEl = (
+        <TeamAssemblyStep
+          activityId={activity.id}
+          studentId={auth.studentId}
+          sessionId={session.id}
+          lessonId={session.lesson_id ?? null}
+          votingActivityId={activity.config?.voting_activity_id as string | undefined}
+          brainstormActivityId={activity.config?.brainstorm_activity_id as string | undefined}
+          xp={(activity.config?.xp_complete as number | undefined) ?? 60}
+          onComplete={onComplete}
+        />
+      );
+    }
+
+    if (!stepEl) {
+      stepEl = (
+        <div className="bg-yellow-400/10 border border-yellow-400/30 rounded-xl p-5 text-yellow-200/80 text-sm">
+          Aktivita typu <code className="bg-background/60 px-1.5 py-0.5 rounded">{activity.type}</code> není v žákovském flow lekce zatím podporována.
+        </div>
+      );
+    }
+
+    return (
+      <LessonShell
+        lessonTitle={lessonTitle}
+        activities={lessonActivities}
+        activityIds={lessonActivityIds}
+        skipped={skippedLaIds}
+        currentIdx={currentActivityIdx}
+        studentEmoji={auth.avatarEmoji}
+        totalXp={totalXp}
+      >
+        {stepEl}
+      </LessonShell>
+    );
+  }
+
+  // LEGACY: multi_activity (sub_activities JSONB)
+  if (activity?.type === "multi_activity" && auth && session) {
+    return (
+      <MultiActivity
+        activity={activity}
+        session={session}
+        studentId={auth.studentId}
+        studentEmoji={auth.avatarEmoji}
+      />
+    );
+  }
+
   // Finished screen
   if (phase === "finished") {
+    // LESSON MODE: pokud jsme dokončili kvíz uvnitř lekce, ale lekce ještě běží
+    // (session je is_active=true), čekáme na učitele, který spustí další aktivitu.
+    // Je ještě některá další (ne-skipped) aktivita za aktuální? (Pokud ne, jsme na poslední.)
+    const hasMoreNonSkipped = lessonActivityIds.some((laId, idx) => idx > currentActivityIdx && !skippedLaIds.has(laId));
+    const lessonStillRunning = !!session?.lesson_id && session.is_active && hasMoreNonSkipped;
+    if (lessonStillRunning && auth) {
+      return (
+        <LessonShell
+          lessonTitle={lessonTitle}
+          activities={lessonActivities}
+          activityIds={lessonActivityIds}
+          skipped={skippedLaIds}
+          currentIdx={currentActivityIdx}
+          studentEmoji={auth.avatarEmoji}
+          totalXp={totalXp}
+        >
+          <ActivityWaitingScreen activityTitle={activity?.title ?? "Aktivita"} />
+        </LessonShell>
+      );
+    }
+
     return (
       <main className="min-h-screen flex flex-col items-center justify-center p-6 bg-background">
         <div className="text-center animate-fade-in max-w-md">
           <div className="text-6xl mb-6">&#127942;</div>
-          <h1 className="text-3xl font-bold text-white mb-4">Kvíz dokončen!</h1>
+          <h1 className="text-3xl font-bold text-white mb-4">
+            {session?.lesson_id ? "Lekce dokončena!" : "Kvíz dokončen!"}
+          </h1>
           <div className="text-5xl font-bold text-accent mb-2">{totalXp} XP</div>
-          <p className="text-foreground/50 mb-8">{activity?.title}</p>
+          <p className="text-foreground/50 mb-8">{session?.lesson_id ? lessonTitle : activity?.title}</p>
           <button
             onClick={() => router.push("/zak/profil")}
             className="px-6 py-3 bg-primary hover:bg-primary/80 text-white font-semibold rounded-xl transition-colors"
@@ -433,12 +686,22 @@ export default function LekcePage({ params }: { params: { code: string } }) {
     );
   }
 
-  // Waiting for teacher - one message per question, based on last result
+  // Waiting for teacher — krátká zpráva podle posledního výsledku.
+  // V assessment módu nedáváme hodnocení (žák nezná správnost) — jen "Odpověď uložena ✓".
   if (phase === "waiting" || phase === "waiting-next") {
-    const messages = lastResult === "corrected" ? GROWTH_CORRECTED_MSGS
-      : lastResult === "correct" ? GROWTH_CORRECT_MSGS
-      : GROWTH_WRONG_MSGS;
-    const msg = phase === "waiting" ? "Připojeno!" : pickMessage(messages, questionNumber);
+    const isAssessment = activityMode === "assessment";
+    let msg = "Připojeno!";
+    if (phase === "waiting-next") {
+      if (isAssessment) {
+        msg = GROWTH_ASSESSMENT_MSG;
+      } else if (lastResult === "corrected") {
+        msg = SKILL_MSG_PRACE_S_CHYBOU;
+      } else if (lastResult === "correct") {
+        msg = SKILL_MSG_PRESNOST;
+      } else {
+        msg = SKILL_MSG_WRONG;
+      }
+    }
 
     return (
       <main className="min-h-screen flex flex-col items-center justify-center p-6 bg-background">
@@ -459,7 +722,9 @@ export default function LekcePage({ params }: { params: { code: string } }) {
             <span className="w-2 h-2 rounded-full bg-accent animate-pulse" />
             <span className="text-foreground/40 text-sm">Sleduji...</span>
           </div>
-          <div className="mt-6 text-3xl font-bold text-accent">{totalXp} XP</div>
+          {!isAssessment && (
+            <div className="mt-6 text-3xl font-bold text-accent">{totalXp} XP</div>
+          )}
         </div>
       </main>
     );
@@ -478,7 +743,10 @@ export default function LekcePage({ params }: { params: { code: string } }) {
           <span className="text-foreground/50 text-sm">
             Otázka {teacherQ + 1} / {questions.length}
           </span>
-          <span className="text-accent font-bold text-sm">{totalXp} XP</span>
+          {/* Assessment: žák nevidí XP počítadlo během testu (žádný feedback) */}
+          {activityMode !== "assessment" && (
+            <span className="text-accent font-bold text-sm">{totalXp} XP</span>
+          )}
         </div>
         <div className="w-full h-2 bg-primary/20 rounded-full overflow-hidden">
           <div
@@ -624,7 +892,7 @@ export default function LekcePage({ params }: { params: { code: string } }) {
           return (
             <div className={`mt-4 p-5 rounded-xl animate-fade-in ${
               isAssessment
-                ? "bg-primary/10 border border-primary/30"
+                ? "bg-primary/10 border border-primary/30"  // neutral — neprozradí správnost
                 : selected === q.correct && attempt > 1
                 ? "bg-green-400/10 border border-green-400/30"
                 : selected === q.correct
@@ -632,26 +900,23 @@ export default function LekcePage({ params }: { params: { code: string } }) {
                 : "bg-yellow-400/10 border border-yellow-400/30"
             }`}>
               <div className="text-center mb-3">
-                {xpGained > 0 && <div className="text-3xl font-bold text-accent mb-1">+{xpGained} XP</div>}
+                {/* Assessment: žádné XP ani hodnocení v průběhu — výsledky až po dokončení testu */}
+                {!isAssessment && xpGained > 0 && (
+                  <div className="text-3xl font-bold text-accent mb-1">+{xpGained} XP</div>
+                )}
                 {isAssessment ? (
                   <p className="text-foreground/60 font-bold">{GROWTH_ASSESSMENT_MSG}</p>
                 ) : lastResult === "timeout" ? (
                   <p className="text-red-400 font-bold">{GROWTH_TIMEOUT_MSG}</p>
                 ) : lastResult === "corrected" ? (
-                  <>
-                    <p className="text-green-400 font-bold text-lg">{pickMessage(GROWTH_CORRECTED_MSGS, questionNumber)}</p>
-                    <p className="text-foreground/50 text-xs mt-1">Chyba je příležitost k učení</p>
-                  </>
+                  <p className="text-green-400 font-bold text-lg">{SKILL_MSG_PRACE_S_CHYBOU}</p>
                 ) : selected === q.correct ? (
-                  <p className="text-accent font-bold">{pickMessage(GROWTH_CORRECT_MSGS, questionNumber)}</p>
+                  <p className="text-accent font-bold">{SKILL_MSG_PRESNOST}</p>
                 ) : (
-                  <>
-                    <p className="text-yellow-300 font-bold">{pickMessage(GROWTH_WRONG_MSGS, questionNumber)}</p>
-                    {xpGained > 0 && <p className="text-foreground/50 text-xs mt-1">+{xpGained} XP za odvahu to zkusit</p>}
-                  </>
+                  <p className="text-yellow-300 font-bold">{SKILL_MSG_WRONG}</p>
                 )}
               </div>
-              {/* V assessment mode neukazujeme vysvětlení */}
+              {/* V assessment módu neukazujeme vysvětlení (žák nemá vědět správnost během testu) */}
               {!isAssessment && <p className="text-foreground/60 text-sm text-center">{q.explanation}</p>}
               <div className="mt-4 w-full h-1 bg-primary/20 rounded-full overflow-hidden">
                 <div className="h-full bg-accent rounded-full" style={{ animation: `countdown ${countdownDuration}s linear forwards` }} />
@@ -661,5 +926,100 @@ export default function LekcePage({ params }: { params: { code: string } }) {
         })()}
       </div>
     </main>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Lesson UI helpers — společný shell pro non-quiz aktivity v lekci.
+// (Quiz aktivita má vlastní top bar s otázkami uvnitř hlavního renderu.)
+// ─────────────────────────────────────────────────────────────────────────
+
+function LessonShell({
+  lessonTitle, activities, activityIds, skipped, currentIdx, studentEmoji, totalXp, children,
+}: {
+  lessonTitle: string;
+  activities: Activity[];
+  activityIds: string[];      // la_id at same index
+  skipped: Set<string>;
+  currentIdx: number;
+  studentEmoji: string;
+  totalXp: number;
+  children: React.ReactNode;
+}) {
+  // Filtruj jen non-skipped aktivity (skip se v UI ignoruje úplně)
+  const visibleIdx: number[] = [];
+  for (let i = 0; i < activities.length; i++) {
+    if (!skipped.has(activityIds[i])) visibleIdx.push(i);
+  }
+  const visibleTotal = visibleIdx.length;
+  const visibleCurrent = visibleIdx.indexOf(currentIdx);
+  const current = activities[currentIdx];
+  return (
+    <main className="min-h-screen bg-background">
+      <header className="px-4 pt-4 pb-3 border-b border-primary/20">
+        <div className="max-w-2xl mx-auto">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h1 className="text-white font-bold text-lg leading-tight">{lessonTitle}</h1>
+              {current && (
+                <p className="text-foreground/50 text-xs mt-0.5">
+                  Aktivita {Math.max(visibleCurrent, 0) + 1} z {visibleTotal} · {current.title}
+                </p>
+              )}
+            </div>
+            <div className="text-right">
+              <div className="text-2xl">{studentEmoji}</div>
+              <div className="text-accent font-bold text-sm">{totalXp} XP</div>
+            </div>
+          </div>
+          <ProgressDots total={visibleTotal} current={Math.max(visibleCurrent, 0)} />
+        </div>
+      </header>
+      <div className="max-w-2xl mx-auto px-4 py-6">{children}</div>
+    </main>
+  );
+}
+
+function ProgressDots({ total, current }: { total: number; current: number }) {
+  return (
+    <div className="flex items-center gap-2 w-full">
+      {Array.from({ length: total }).map((_, i) => {
+        const done = i < current;
+        const active = i === current;
+        return (
+          <div key={i} className="flex-1 flex items-center gap-2">
+            <div
+              className={`flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all ${
+                done
+                  ? "bg-accent text-background"
+                  : active
+                  ? "bg-accent/20 text-accent border-2 border-accent"
+                  : "bg-primary/20 text-foreground/40 border-2 border-primary/30"
+              }`}
+            >
+              {done ? "✓" : i + 1}
+            </div>
+            {i < total - 1 && (
+              <div className={`flex-1 h-1 rounded-full ${done ? "bg-accent" : "bg-primary/20"}`} />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ActivityWaitingScreen({ activityTitle }: { activityTitle: string }) {
+  return (
+    <div className="text-center py-12 animate-fade-in">
+      <div className="text-6xl mb-4">⏸️</div>
+      <h2 className="text-2xl font-bold text-white mb-2">Aktivita dokončena</h2>
+      <p className="text-foreground/60 text-sm mb-1">{activityTitle}</p>
+      <p className="text-foreground/40 text-sm mt-4">Čekej, až učitel spustí další aktivitu…</p>
+      <div className="flex items-center justify-center gap-2 mt-6">
+        <span className="w-2 h-2 rounded-full bg-accent animate-pulse" />
+        <span className="text-foreground/40 text-xs">Sleduji</span>
+      </div>
+    </div>
   );
 }
